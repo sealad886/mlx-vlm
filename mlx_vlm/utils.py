@@ -34,6 +34,7 @@ MODEL_REMAPPING = {
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
     "jvlm": "jina_vlm",
+    "glm-image": "glm_image",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -88,6 +89,47 @@ def skip_multimodal_module(path: str) -> bool:
         or "audio_tower" in path
         or "code_predictor" in path
     )
+
+
+def get_class_predicate(
+    skip_vision: bool = False,
+    weights: Optional[dict] = None,
+    quantization_overrides: Optional[dict] = None,
+):
+    """Build the quantization class predicate used by ``nn.quantize``.
+
+    Args:
+        skip_vision: Whether to skip quantizing multimodal modules.
+        weights: Optional loaded weights dict used to detect pre-quantized layers.
+        quantization_overrides: Optional path-level override map.
+
+    Returns:
+        Callable predicate ``(path, module) -> bool``.
+    """
+
+    quantization_overrides = quantization_overrides or {}
+
+    def predicate(path: str, module: nn.Module) -> bool:
+        if skip_vision and skip_multimodal_module(path):
+            return False
+
+        if path in quantization_overrides and isinstance(
+            quantization_overrides[path], bool
+        ):
+            return quantization_overrides[path]
+
+        if not hasattr(module, "to_quantized"):
+            return False
+
+        if hasattr(module, "weight") and module.weight.size % 64 != 0:
+            return False
+
+        if weights is None:
+            return True
+
+        return f"{path}.scales" in weights
+
+    return predicate
 
 
 def get_model_and_args(config: dict):
@@ -280,28 +322,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
+        class_predicate = get_class_predicate(
+            skip_vision=skip_vision,
+            weights=weights,
+            quantization_overrides=config.get("quantization", {}),
+        )
 
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=class_predicate,
         )
 
     if kwargs.get("quantize_activations", False):
@@ -917,7 +949,24 @@ def prepare_inputs(
     **kwargs,
 ):
 
-    if not images and not audio:
+    def _has_payload(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (list, tuple, dict, set, str, bytes)):
+            return len(value) > 0
+        return True
+
+    if not _has_payload(images) and not _has_payload(audio):
+        prompt_list = prompts if isinstance(prompts, list) else [prompts]
+        image_token_count = sum(
+            str(prompt).count("<image>") for prompt in prompt_list if prompt is not None
+        )
+        if image_token_count > 0:
+            raise ValueError(
+                "Number of image tokens in prompt_token_ids "
+                f"({image_token_count}) does not match number of images (0)"
+            )
+
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )

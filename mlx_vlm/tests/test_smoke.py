@@ -9,6 +9,14 @@ import textwrap
 import time
 import traceback
 
+if __name__ != "__main__" and "pytest" in sys.modules:
+    import pytest
+
+    pytest.skip(
+        "test_smoke.py is a manual smoke-test runner script, not a pytest module.",
+        allow_module_level=True,
+    )
+
 import mlx.core as mx
 
 

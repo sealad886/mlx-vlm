@@ -2178,6 +2178,82 @@ class TestModels(unittest.TestCase):
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
 
+    def test_glm_image(self):
+        from mlx_vlm.models import glm_image
+
+        text_config = glm_image.TextConfig(
+            model_type="glm_image_text",
+            vocab_size=1000,
+            vision_vocab_size=256,
+            hidden_size=128,
+            num_hidden_layers=2,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=1000,
+            rope_parameters={
+                "rope_type": "default",
+                "mrope_section": [8, 12, 12],
+                "partial_rotary_factor": 1.0,
+                "rope_theta": 10000,
+            },
+        )
+
+        vision_config = glm_image.VisionConfig(
+            model_type="glm_image_vision",
+            depth=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_heads=4,
+            patch_size=16,
+            image_size=256,
+            in_channels=3,
+            layer_norm_eps=1e-6,
+            spatial_merge_size=1,
+        )
+
+        vq_config = glm_image.VQConfig(
+            model_type="glm_image_vqmodel",
+            embed_dim=64,
+            num_embeddings=128,
+            latent_channels=64,
+            in_channels=3,
+        )
+
+        config = glm_image.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            vq_config=vq_config,
+            model_type="glm_image",
+            image_token_id=999,
+            image_start_token_id=997,
+            image_end_token_id=998,
+        )
+
+        model = glm_image.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vision_vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        grid_thw = mx.array([[1, 8, 8]], dtype=mx.int64)
+        num_patches = int(grid_thw[0, 0] * grid_thw[0, 1] * grid_thw[0, 2])
+        pixel_values = mx.random.uniform(
+            shape=(
+                num_patches,
+                config.vision_config.in_channels * config.vision_config.patch_size**2,
+            )
+        )
+
+        hidden_states = model.vision_model(pixel_values, grid_thw)
+        self.assertEqual(hidden_states.shape[0], num_patches)
+        self.assertEqual(hidden_states.shape[1], config.vision_config.hidden_size)
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -3293,6 +3369,57 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "glm_ocr")
+
+    def test_glm_image_input_embeddings(self):
+        from mlx_vlm.models import glm_image
+
+        model = glm_image.Model(
+            glm_image.ModelConfig(
+                text_config=glm_image.TextConfig(
+                    model_type="glm_image_text",
+                    vocab_size=32,
+                    vision_vocab_size=16,
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    rms_norm_eps=1e-5,
+                    max_position_embeddings=256,
+                    rope_parameters={
+                        "rope_type": "default",
+                        "mrope_section": [2, 3, 3],
+                        "partial_rotary_factor": 1.0,
+                        "rope_theta": 10000,
+                    },
+                ),
+                vision_config=glm_image.VisionConfig(
+                    model_type="glm_image_vision",
+                    depth=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_heads=2,
+                    patch_size=14,
+                    image_size=28,
+                    in_channels=3,
+                    layer_norm_eps=1e-6,
+                    spatial_merge_size=1,
+                ),
+                vq_config=glm_image.VQConfig(
+                    model_type="glm_image_vqmodel",
+                    embed_dim=16,
+                    num_embeddings=32,
+                    latent_channels=16,
+                    in_channels=3,
+                ),
+                model_type="glm_image",
+                image_token_id=31,
+                image_start_token_id=29,
+                image_end_token_id=30,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "glm_image")
 
 
 class TestChunkedPrefillRoPE(unittest.TestCase):

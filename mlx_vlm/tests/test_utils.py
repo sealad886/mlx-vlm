@@ -36,9 +36,27 @@ class MockTorch:
 
 class MockProcessor:
     def __init__(self):
-        self.tokenizer = type(
-            "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
-        )()
+        class DummyTokenizer:
+            pad_token = None
+            eos_token = "[EOS]"
+
+            def __call__(
+                self,
+                text,
+                add_special_tokens=False,
+                padding=True,
+                padding_side="left",
+            ):
+                return type(
+                    "Tokenized",
+                    (),
+                    {
+                        "input_ids": [1, 2, 3],
+                        "attention_mask": [1, 1, 1],
+                    },
+                )()
+
+        self.tokenizer = DummyTokenizer()
 
     def __call__(
         self, text=None, images=None, audio=None, padding=None, return_tensors="mlx"
@@ -427,4 +445,6 @@ def test_load_passes_revision():
 
         assert model is model_mock
         assert processor is processor_mock
-        mock_get_model_path.assert_called_with("repo", revision="abc")
+        mock_get_model_path.assert_called_with(
+            "repo", force_download=False, revision="abc"
+        )

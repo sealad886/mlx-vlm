@@ -125,5 +125,94 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
 
 
+class _DummyGlmImageTokenizer:
+    image_token = "<|image|>"
+    grid_bos_token = "<sop>"
+    grid_eos_token = "<eop>"
+    bos_token = "<bos>"
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def __init__(self):
+        self.last_texts = []
+
+    def convert_tokens_to_ids(self, token):
+        return 999 if token == self.image_token else 0
+
+    def __call__(self, text, **kwargs):
+        self.last_texts = list(text)
+        return {
+            "input_ids": [[1, 2, 3] for _ in text],
+            "attention_mask": [[1, 1, 1] for _ in text],
+        }
+
+    def apply_chat_template(
+        self, conversation, tokenize, add_generation_prompt, **kwargs
+    ):
+        return "templated prompt"
+
+    def batch_decode(self, *args, **kwargs):
+        return []
+
+    def decode(self, *args, **kwargs):
+        return ""
+
+
+class _DummyGlmImageImageProcessor:
+    model_input_names = ["pixel_values", "image_grid_thw"]
+
+    def __call__(self, images=None, **kwargs):
+        num_images = len(images) if isinstance(images, list) else 1
+        return {
+            "pixel_values": np.zeros((num_images * 4, 3 * 16 * 16), dtype=np.float32),
+            "image_grid_thw": np.array([[1, 2, 2]] * num_images, dtype=np.int64),
+        }
+
+
+class TestGlmImageProcessor(unittest.TestCase):
+    @staticmethod
+    def _make_processor(tokenizer, image_processor):
+        from mlx_vlm.models.glm_image.processing import GlmImageProcessor
+
+        processor = GlmImageProcessor.__new__(GlmImageProcessor)
+        processor.tokenizer = tokenizer
+        processor.image_processor = image_processor
+        processor.image_token = tokenizer.image_token
+        processor.grid_bos_token = tokenizer.grid_bos_token
+        processor.grid_eos_token = tokenizer.grid_eos_token
+        processor.bos_token = tokenizer.bos_token
+        processor.image_token_id = tokenizer.convert_tokens_to_ids(
+            tokenizer.image_token
+        )
+        return processor
+
+    def test_text_to_image_adds_target_grids(self):
+        tokenizer = _DummyGlmImageTokenizer()
+        image_processor = _DummyGlmImageImageProcessor()
+        processor = self._make_processor(tokenizer, image_processor)
+
+        outputs = processor(text="create an image", target_h=1152, target_w=768)
+
+        self.assertEqual(outputs["image_grid_thw"].shape, (2, 3))
+        self.assertTrue(np.array_equal(outputs["images_per_sample"], np.array([2])))
+        self.assertIn("<sop>", tokenizer.last_texts[0])
+        self.assertIn("<eop>", tokenizer.last_texts[0])
+
+    def test_image_to_image_expands_source_placeholders(self):
+        tokenizer = _DummyGlmImageTokenizer()
+        image_processor = _DummyGlmImageImageProcessor()
+        processor = self._make_processor(tokenizer, image_processor)
+
+        outputs = processor(
+            images=[Image.new("RGB", (32, 32), color="red")], text="edit <|image|>"
+        )
+
+        self.assertEqual(tokenizer.last_texts[0].count("<|image|>"), 4)
+        self.assertEqual(outputs["image_grid_thw"].shape, (2, 3))
+        self.assertTrue(
+            np.array_equal(outputs["image_grid_thw"][0], np.array([1, 2, 2]))
+        )
+        self.assertTrue(np.array_equal(outputs["images_per_sample"], np.array([2])))
+
+
 if __name__ == "__main__":
     unittest.main()
