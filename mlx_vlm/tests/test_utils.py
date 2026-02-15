@@ -8,10 +8,13 @@ from mlx_lm.utils import quantize_model
 
 from mlx_vlm.utils import (
     StoppingCriteria,
+    find_model_config_path,
     get_class_predicate,
     load,
+    load_config,
     prepare_inputs,
     process_inputs_with_fallback,
+    resolve_model_directory,
     sanitize_weights,
     update_module_configs,
 )
@@ -448,3 +451,46 @@ def test_load_passes_revision():
         mock_get_model_path.assert_called_with(
             "repo", force_download=False, revision="abc"
         )
+
+
+def test_find_model_config_path_prefers_supported_nested_model(tmp_path):
+    (tmp_path / "text_encoder").mkdir()
+    (tmp_path / "vision_language_encoder").mkdir()
+
+    (tmp_path / "text_encoder" / "config.json").write_text(
+        '{"model_type": "bert", "architectures": ["BertModel"]}',
+        encoding="utf-8",
+    )
+    (tmp_path / "text_encoder" / "model.safetensors").write_text("", encoding="utf-8")
+
+    (tmp_path / "vision_language_encoder" / "config.json").write_text(
+        '{"model_type": "glm-image", "architectures": ["GLMImageModel"]}',
+        encoding="utf-8",
+    )
+    (tmp_path / "vision_language_encoder" / "model.safetensors").write_text(
+        "", encoding="utf-8"
+    )
+
+    config_path = find_model_config_path(tmp_path)
+    assert config_path == tmp_path / "vision_language_encoder" / "config.json"
+
+    resolved_model_dir = resolve_model_directory(tmp_path)
+    assert resolved_model_dir == tmp_path / "vision_language_encoder"
+
+
+def test_load_config_reads_nested_generation_config(tmp_path):
+    model_dir = tmp_path / "vision_language_encoder"
+    model_dir.mkdir()
+
+    (model_dir / "config.json").write_text(
+        '{"model_type": "glm-image", "eos_token_id": 1}',
+        encoding="utf-8",
+    )
+    (model_dir / "generation_config.json").write_text(
+        '{"eos_token_id": 42}',
+        encoding="utf-8",
+    )
+
+    config = load_config(tmp_path)
+    assert config["model_type"] == "glm-image"
+    assert config["eos_token_id"] == 42

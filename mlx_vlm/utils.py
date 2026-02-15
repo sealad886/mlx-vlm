@@ -191,6 +191,76 @@ def get_model_path(
     return model_path
 
 
+def _is_supported_model_type(model_type: Optional[str]) -> bool:
+    if not isinstance(model_type, str):
+        return False
+
+    remapped_model_type = MODEL_REMAPPING.get(model_type.lower(), model_type.lower())
+    models_dir = Path(__file__).resolve().parent / "models"
+    return (models_dir / remapped_model_type).is_dir()
+
+
+def find_model_config_path(model_path: Union[str, Path]) -> Path:
+    """Find the most likely model ``config.json`` for a model directory.
+
+    Supports model snapshots where ``config.json`` lives in a nested folder
+    (for example ``vision_language_encoder/config.json``).
+    """
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
+
+    model_path = Path(model_path)
+    direct_config = model_path / "config.json"
+    if direct_config.exists():
+        return direct_config
+
+    candidates = []
+    for config_path in model_path.rglob("config.json"):
+        if config_path == direct_config:
+            continue
+
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(config, dict):
+            continue
+
+        score = 0
+        if "model_type" in config:
+            score += 5
+        if _is_supported_model_type(config.get("model_type")):
+            score += 10
+        if "architectures" in config:
+            score += 2
+        if list(config_path.parent.glob("*.safetensors")):
+            score += 6
+        if (config_path.parent / "model.safetensors.index.json").exists():
+            score += 4
+        if config_path.parent.name in {
+            "vision_language_encoder",
+            "language_model",
+            "model",
+        }:
+            score += 1
+
+        if score > 0:
+            candidates.append((score, -len(config_path.parts), config_path))
+
+    if not candidates:
+        raise FileNotFoundError(f"Config not found at {model_path}")
+
+    _, _, best_config_path = max(candidates, key=lambda item: (item[0], item[1]))
+    return best_config_path
+
+
+def resolve_model_directory(model_path: Union[str, Path]) -> Path:
+    """Resolve the effective directory that contains model config and weights."""
+    return find_model_config_path(model_path).parent
+
+
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -216,19 +286,21 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
-    config = load_config(model_path, **kwargs)
+    model_path = Path(model_path)
+    resolved_model_path = resolve_model_directory(model_path)
+    config = load_config(resolved_model_path, **kwargs)
 
     # Find all .safetensors files in the model_path, excluding consolidated model weights
     weight_files = [
         wf
-        for wf in glob.glob(str(model_path / "*.safetensors"))
+        for wf in glob.glob(str(resolved_model_path / "*.safetensors"))
         if not wf.endswith("consolidated.safetensors")
     ]
 
     if not weight_files:
-        logging.error(f"No safetensors found in {model_path}")
+        logging.error(f"No safetensors found in {resolved_model_path}")
         message = f"""
-No safetensors found in {model_path}
+    No safetensors found in {resolved_model_path}
 Create safetensors using the following code:
 ```
 from transformers import AutoModelForCausalLM, AutoProcessor
@@ -455,14 +527,17 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     Raises:
         FileNotFoundError: If config.json is not found at the path
     """
-    if isinstance(model_path, str):
-        model_path = get_model_path(model_path)
+    model_path = (
+        get_model_path(model_path) if isinstance(model_path, str) else model_path
+    )
+    model_path = Path(model_path)
+    config_path = find_model_config_path(model_path)
 
     try:
-        with open(model_path / "config.json", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             config = json.load(f)
 
-        generation_config_file = model_path / "generation_config.json"
+        generation_config_file = config_path.parent / "generation_config.json"
         if generation_config_file.exists():
             generation_config = {}
             try:

@@ -13,6 +13,7 @@ from .utils import (
     MODEL_CONVERSION_DTYPES,
     fetch_from_hub,
     get_model_path,
+    resolve_model_directory,
     save_config,
     save_weights,
     skip_multimodal_module,
@@ -117,6 +118,7 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
+    resolved_model_path = resolve_model_directory(model_path)
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
@@ -170,14 +172,24 @@ def convert(
 
     save_weights(mlx_path, model, donate_weights=True)
 
-    # Copy Python and JSON files from the model path to the MLX path
-    for pattern in ["*.py", "*.json"]:
-        files = glob.glob(str(model_path / pattern))
-        for file in files:
-            # Skip the index file - save_weights() already generated the correct one
-            if Path(file).name == "model.safetensors.index.json":
-                continue
-            shutil.copy(file, mlx_path)
+    # Copy Python and JSON files from model roots to the MLX path.
+    # Some snapshots (for example GLM-Image) keep model files in nested folders.
+    copy_sources = [model_path]
+    if resolved_model_path != model_path:
+        copy_sources.append(resolved_model_path)
+
+    copied_files = set()
+    for source in copy_sources:
+        for pattern in ["*.py", "*.json"]:
+            files = glob.glob(str(source / pattern))
+            for file in files:
+                filename = Path(file).name
+                if filename == "model.safetensors.index.json":
+                    continue
+                if filename in copied_files:
+                    continue
+                shutil.copy(file, mlx_path)
+                copied_files.add(filename)
 
     processor.save_pretrained(mlx_path)
 
