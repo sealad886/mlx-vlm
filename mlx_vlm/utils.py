@@ -261,6 +261,41 @@ def resolve_model_directory(model_path: Union[str, Path]) -> Path:
     return find_model_config_path(model_path).parent
 
 
+def _contains_processor_assets(path: Path) -> bool:
+    processor_files = {
+        "processor_config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+    }
+    return any((path / file_name).exists() for file_name in processor_files)
+
+
+def resolve_processor_directory(model_path: Union[str, Path]) -> Path:
+    """Resolve the directory that stores processor/tokenizer metadata."""
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
+
+    model_path = Path(model_path)
+    resolved_model_path = resolve_model_directory(model_path)
+
+    candidates = [
+        model_path,
+        model_path / "processor",
+        resolved_model_path,
+        resolved_model_path / "processor",
+    ]
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_dir() and _contains_processor_assets(candidate):
+            return candidate
+
+    return model_path
+
+
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -582,9 +617,10 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    processor_path = resolve_processor_directory(model_path)
+    processor = AutoProcessor.from_pretrained(processor_path, use_fast=True, **kwargs)
     if add_detokenizer:
-        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+        detokenizer_class = load_tokenizer(processor_path, return_tokenizer=False)
 
         # Get the tokenizer object
         tokenizer_obj = (

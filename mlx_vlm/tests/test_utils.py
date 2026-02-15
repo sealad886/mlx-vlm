@@ -12,9 +12,11 @@ from mlx_vlm.utils import (
     get_class_predicate,
     load,
     load_config,
+    load_processor,
     prepare_inputs,
     process_inputs_with_fallback,
     resolve_model_directory,
+    resolve_processor_directory,
     sanitize_weights,
     update_module_configs,
 )
@@ -494,3 +496,45 @@ def test_load_config_reads_nested_generation_config(tmp_path):
     config = load_config(tmp_path)
     assert config["model_type"] == "glm-image"
     assert config["eos_token_id"] == 42
+
+
+def test_resolve_processor_directory_prefers_processor_subdir(tmp_path):
+    model_dir = tmp_path / "vision_language_encoder"
+    model_dir.mkdir()
+
+    (model_dir / "config.json").write_text(
+        '{"model_type": "glm-image"}',
+        encoding="utf-8",
+    )
+    (model_dir / "model.safetensors").write_text("", encoding="utf-8")
+
+    processor_dir = tmp_path / "processor"
+    processor_dir.mkdir()
+    (processor_dir / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+
+    resolved = resolve_processor_directory(tmp_path)
+    assert resolved == processor_dir
+
+
+def test_load_processor_uses_resolved_processor_directory(tmp_path):
+    model_dir = tmp_path / "vision_language_encoder"
+    model_dir.mkdir()
+
+    (model_dir / "config.json").write_text(
+        '{"model_type": "glm-image"}',
+        encoding="utf-8",
+    )
+    (model_dir / "model.safetensors").write_text("", encoding="utf-8")
+
+    processor_dir = tmp_path / "processor"
+    processor_dir.mkdir()
+    (processor_dir / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+
+    processor_mock = MagicMock()
+    with patch(
+        "mlx_vlm.utils.AutoProcessor.from_pretrained", return_value=processor_mock
+    ) as mocked_auto_processor:
+        result = load_processor(tmp_path, add_detokenizer=False)
+
+    assert result is processor_mock
+    mocked_auto_processor.assert_called_once_with(processor_dir, use_fast=True)
