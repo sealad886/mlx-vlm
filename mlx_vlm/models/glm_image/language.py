@@ -22,6 +22,7 @@ def _compute_default_rope_parameters(
             f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
         )
 
+    base, dim = (1.0, 1)
     if len(rope_kwargs) > 0:
         base = rope_kwargs["base"]
         dim = rope_kwargs["dim"]
@@ -251,9 +252,11 @@ class GlmImageTextModel(nn.Module):
 
         if position_ids is None:
             offset = cache[0].offset if cache and cache[0] is not None else 0
-            position_ids = mx.arange(offset, offset + h.shape[-2])
+            position_ids = mx.arange(offset, offset + h.shape[-2], dtype=mx.int64)
             position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
+            position_ids = mx.broadcast_to(position_ids, (h.shape[0], h.shape[-2]))
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.broadcast_to(position_ids, (3, h.shape[0], h.shape[-2]))
 
         position_embeddings = self.rotary_emb(h, position_ids)
 
@@ -295,7 +298,7 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
+                position_ids = mx.expand_dims(position_ids, axis=0)
                 position_ids = mx.tile(position_ids, (3, 1, 1))
             else:
                 position_ids = mx.arange(seq_length).reshape(1, -1)

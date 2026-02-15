@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -55,7 +55,7 @@ class GlmImageVisionAttention(nn.Module):
         k = qkv[1].transpose(1, 0, 2)[None, ...]
         v = qkv[2].transpose(1, 0, 2)[None, ...]
 
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        lengths: Sequence[int] = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         split_indices = []
         cumsum = 0
         for length in lengths[:-1]:

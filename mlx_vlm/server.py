@@ -619,6 +619,10 @@ async def responses_endpoint(request: Request):
             # Streaming response
             async def stream_generator():
                 token_iterator = None
+                usage_stats = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                }
                 try:
                     # Create base response object (to match the openai pipeline)
                     base_response = OpenAIResponse(
@@ -849,7 +853,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": message.content}
                 )
             elif isinstance(message.content, list):
-                text_content = ""
+                text_parts = []
                 for item in message.content:
                     if isinstance(item, dict):
                         # Only extract images/audio from user messages
@@ -861,9 +865,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                             elif item["type"] == "input_audio":
                                 audio.append(item["input_audio"]["data"])
                         if item["type"] in ("text", "input_text"):
-                            text_content = item.get("text", "")
+                            item_text = item.get("text", "")
+                            if item_text:
+                                text_parts.append(item_text)
                 processed_messages.append(
-                    {"role": message.role, "content": text_content}
+                    {"role": message.role, "content": " ".join(text_parts)}
                 )
 
         formatted_prompt = apply_chat_template(
@@ -878,6 +884,14 @@ async def chat_completions_endpoint(request: ChatRequest):
             # Streaming response
             async def stream_generator():
                 token_iterator = None
+                usage_stats = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "prompt_tps": 0,
+                    "generation_tps": 0,
+                    "peak_memory": 0,
+                }
                 try:
                     # Use stream_generate from utils
                     token_iterator = stream_generate(

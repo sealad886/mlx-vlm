@@ -93,7 +93,7 @@ def parse_arguments():
         help="Temperature for sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
-    parser.add_argument("--verbose", action="store_false", help="Detailed output.")
+    parser.add_argument("--verbose", action="store_true", help="Detailed output.")
     parser.add_argument(
         "--eos-tokens",
         type=str,
@@ -1272,18 +1272,17 @@ def main():
     model, processor = load(
         args.model,
         args.adapter_path,
+        force_download=args.force_download,
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
         quantize_activations=args.quantize_activations,
     )
     config = model.config
 
-    prompt = args.prompt
+    prompt = " ".join(args.prompt) if isinstance(args.prompt, list) else args.prompt
 
     num_images = len(args.image) if args.image is not None else 0
-    num_audios = (
-        1 if args.audio is not None else 0
-    )  # TODO: Support multiple audio files
+    num_audios = len(args.audio) if args.audio is not None else 0
     prompt = apply_chat_template(
         processor, config, prompt, num_images=num_images, num_audios=num_audios
     )

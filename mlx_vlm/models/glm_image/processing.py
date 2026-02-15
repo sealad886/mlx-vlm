@@ -191,7 +191,7 @@ class GlmImageProcessor(ProcessorMixin):
             dtype=np.int64,
         )
 
-        text_inputs = self.tokenizer(
+        text_inputs = self.tokenizer(  # noqa: E501 #type: ignore
             text,
             padding=padding,
             return_token_type_ids=return_token_type_ids,
@@ -247,8 +247,11 @@ class GlmImageProcessor(ProcessorMixin):
                     continue
                 if item.get("type") in {"image", "input_image", "image_url"}:
                     image_ref = item.get("url") or item.get("image")
-                    if image_ref is None and isinstance(item.get("image_url"), dict):
-                        image_ref = item["image_url"].get("url")
+                    image_url = item.get("image_url")
+                    if image_ref is None and isinstance(image_url, dict):
+                        image_ref = image_url.get("url")
+                    if image_ref is None and isinstance(image_url, str):
+                        image_ref = image_url
                     if image_ref is not None:
                         images.append(image_ref)
 
