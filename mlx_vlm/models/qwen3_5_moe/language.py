@@ -4,15 +4,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
-from ..qwen3_5.language import (
-    MTPDecoderLayer,
-    MTPModule,
-    Qwen3_5Model,
-    _target_verify_linear,
-)
+from ..qwen3_5.language import MTPDecoderLayer, MTPModule
 from ..qwen3_5.language import Qwen3_5Attention as Qwen3_5MoeAttention
 from ..qwen3_5.language import Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet
 from ..qwen3_5.language import Qwen3_5MLP as Qwen3_5MoeMLP
+from ..qwen3_5.language import Qwen3_5Model, _target_verify_linear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
 
@@ -159,5 +155,5 @@ class LanguageModel(Qwen3_5LanguageModel):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        if args.mtp_num_hidden_layers > 0:
+        if getattr(args, "mtp_num_hidden_layers", 0) > 0:
             self.mtp = MTPModule(args, MTPMoeDecoderLayer)

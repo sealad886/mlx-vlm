@@ -26,11 +26,14 @@ class Model(Qwen3_5Model):
             for key, value in weights.items()
         )
         has_mtp = any("mtp." in key for key in weights)
-        if self.config.text_config.mtp_num_hidden_layers > 0 and not has_mtp:
+        mtp_num_hidden_layers = getattr(
+            self.config.text_config, "mtp_num_hidden_layers", 0
+        )
+        if mtp_num_hidden_layers > 0 and not has_mtp:
             raise ValueError(
                 "Config enables MTP but checkpoint contains no MTP parameters"
             )
-        if self.config.text_config.mtp_num_hidden_layers <= 0:
+        if mtp_num_hidden_layers <= 0:
             weights = {
                 key: value for key, value in weights.items() if "mtp." not in key
             }
@@ -64,7 +67,7 @@ class Model(Qwen3_5Model):
                         ]
                     )
 
-        for layer_index in range(self.config.text_config.mtp_num_hidden_layers):
+        for layer_index in range(mtp_num_hidden_layers):
             prefix = f"mtp.layers.{layer_index}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key in weights:

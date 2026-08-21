@@ -1,4 +1,3 @@
-
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -151,11 +150,14 @@ class Model(Qwen3VLModel):
             for key, value in weights.items()
         )
         has_mtp = any("mtp." in key for key in weights)
-        if self.config.text_config.mtp_num_hidden_layers > 0 and not has_mtp:
+        mtp_num_hidden_layers = getattr(
+            self.config.text_config, "mtp_num_hidden_layers", 0
+        )
+        if mtp_num_hidden_layers > 0 and not has_mtp:
             raise ValueError(
                 "Config enables MTP but checkpoint contains no MTP parameters"
             )
-        if self.config.text_config.mtp_num_hidden_layers <= 0:
+        if mtp_num_hidden_layers <= 0:
             weights = {
                 key: value for key, value in weights.items() if "mtp." not in key
             }

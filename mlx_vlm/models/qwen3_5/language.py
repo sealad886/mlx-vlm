@@ -2140,7 +2140,7 @@ class LanguageModel(nn.Module):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        if args.mtp_num_hidden_layers > 0:
+        if getattr(args, "mtp_num_hidden_layers", 0) > 0:
             self.mtp = MTPModule(args, mtp_layer_type)
 
     def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
@@ -2946,7 +2946,7 @@ class LanguageModel(nn.Module):
     def quant_predicate(self):
         if (
             getattr(self.args, "num_experts", 0) <= 0
-            and self.args.mtp_num_hidden_layers <= 0
+            and getattr(self.args, "mtp_num_hidden_layers", 0) <= 0
         ):
             return None
 
