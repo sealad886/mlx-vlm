@@ -25,6 +25,15 @@ class Model(Qwen3_5Model):
             "conv1d.weight" in key and value.shape[-1] != 1
             for key, value in weights.items()
         )
+        has_mtp = any("mtp." in key for key in weights)
+        if self.config.text_config.mtp_num_hidden_layers > 0 and not has_mtp:
+            raise ValueError(
+                "Config enables MTP but checkpoint contains no MTP parameters"
+            )
+        if self.config.text_config.mtp_num_hidden_layers <= 0:
+            weights = {
+                key: value for key, value in weights.items() if "mtp." not in key
+            }
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)

@@ -9,7 +9,11 @@ from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model as MoEModel
 def _model_for_sanitize(model_class):
     model = model_class.__new__(model_class)
     model.config = SimpleNamespace(
-        text_config=SimpleNamespace(tie_word_embeddings=False, num_hidden_layers=0)
+        text_config=SimpleNamespace(
+            tie_word_embeddings=False,
+            num_hidden_layers=0,
+            mtp_num_hidden_layers=0,
+        )
     )
     return model
 
