@@ -6,7 +6,6 @@ from ..qwen3_5.qwen3_5 import (
     NORM_WEIGHT_SUFFIXES,
     sanitize_key,
     should_offset_norm_weight,
-    should_shift_norm_weights,
 )
 from .config import ModelConfig
 from .language import LanguageModel
@@ -14,7 +13,6 @@ from .vision import VisionModel
 
 
 class Model(Qwen3_5Model):
-
     def __init__(self, config: ModelConfig):
         # only initialize nn.Module, skip the initialization of vision_tower and language_model in the parent class
         nn.Module.__init__(self)
@@ -23,10 +21,10 @@ class Model(Qwen3_5Model):
         self.language_model = LanguageModel(config.text_config, config)
 
     def sanitize(self, weights):
-        # The MTP draft shard is separate from the base model. Its presence
-        # must not select the base model's RMSNorm loading convention.
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
-        shift_norm_weights = should_shift_norm_weights(weights)
+        shift_norm_weights = any(
+            "conv1d.weight" in key and value.shape[-1] != 1
+            for key, value in weights.items()
+        )
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -56,6 +54,22 @@ class Model(Qwen3_5Model):
                             for e in range(self.config.text_config.num_experts)
                         ]
                     )
+
+        for layer_index in range(self.config.text_config.mtp_num_hidden_layers):
+            prefix = f"mtp.layers.{layer_index}.mlp"
+            gate_up_key = f"{prefix}.experts.gate_up_proj"
+            if gate_up_key in weights:
+                gate_up = weights.pop(gate_up_key)
+                midpoint = gate_up.shape[-2] // 2
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
+                    ..., :midpoint, :
+                ]
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
+                    ..., midpoint:, :
+                ]
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                    f"{prefix}.experts.down_proj"
+                )
 
         sanitized_weights = {}
         for key, value in weights.items():

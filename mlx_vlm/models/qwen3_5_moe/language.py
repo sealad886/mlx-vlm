@@ -1,13 +1,18 @@
-from typing import Any, Optional
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
+from ..qwen3_5.language import (
+    MTPDecoderLayer,
+    MTPModule,
+    Qwen3_5Model,
+    _target_verify_linear,
+)
 from ..qwen3_5.language import Qwen3_5Attention as Qwen3_5MoeAttention
 from ..qwen3_5.language import Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet
 from ..qwen3_5.language import Qwen3_5MLP as Qwen3_5MoeMLP
-from ..qwen3_5.language import Qwen3_5Model, _target_verify_linear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
 
@@ -91,11 +96,11 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        position_ids: Optional[mx.array] = None,
-        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
-        gdn_sink: Optional[list] = None,
+        mask: mx.array | None = None,
+        cache: Any | None = None,
+        position_ids: mx.array | None = None,
+        position_embeddings: tuple[mx.array, mx.array] | None = None,
+        gdn_sink: list | None = None,
         target_verify: bool = False,
     ) -> mx.array:
         if self.is_linear:
@@ -120,8 +125,15 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         return out
 
 
-class Qwen3_5MoeModel(Qwen3_5Model):
+class MTPMoeDecoderLayer(MTPDecoderLayer):
+    """Full-attention MTP layer with the Qwen3.5 MoE feed-forward block."""
 
+    def __init__(self, args: TextConfig):
+        super().__init__(args)
+        self.mlp = Qwen3_5MoeSparseMoeBlock(args)
+
+
+class Qwen3_5MoeModel(Qwen3_5Model):
     def __init__(self, args: TextConfig):
         nn.Module.__init__(self)
         self.args = args
@@ -136,7 +148,6 @@ class Qwen3_5MoeModel(Qwen3_5Model):
 
 
 class LanguageModel(Qwen3_5LanguageModel):
-
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
         self.args = args
@@ -148,3 +159,5 @@ class LanguageModel(Qwen3_5LanguageModel):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MTPModule(args, MTPMoeDecoderLayer)

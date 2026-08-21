@@ -1,4 +1,3 @@
-from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,7 +13,11 @@ from .vision import VisionModel
 
 
 def sanitize_key(key):
-    if key.startswith("model.language_model.visual"):
+    if key.startswith("mtp."):
+        key = key.replace("mtp", "language_model.mtp", 1)
+    elif key.startswith("model.language_model.mtp"):
+        key = key.replace("model.language_model.mtp", "language_model.mtp", 1)
+    elif key.startswith("model.language_model.visual"):
         key = key.replace("model.language_model.visual", "vision_tower", 1)
     elif key.startswith("model.language_model"):
         key = key.replace("model.language_model", "language_model.model", 1)
@@ -48,7 +51,6 @@ def should_offset_norm_weight(original_key, shift_norm_weights):
 
 
 class Model(Qwen3VLModel):
-
     def __init__(self, config: ModelConfig):
         # only initialize nn.Module, skip the initialization of vision_tower and language_model in the parent class
         nn.Module.__init__(self)
@@ -58,16 +60,16 @@ class Model(Qwen3VLModel):
 
     def get_input_embeddings(
         self,
-        input_ids: Optional[mx.array] = None,
-        pixel_values: Optional[mx.array] = None,
+        input_ids: mx.array | None = None,
+        pixel_values: mx.array | None = None,
         **kwargs,
     ):
         if pixel_values is None:
-            pixel_values = kwargs.get("pixel_values_videos", None)
+            pixel_values = kwargs.get("pixel_values_videos")
 
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
+        image_grid_thw = kwargs.get("image_grid_thw")
+        video_grid_thw = kwargs.get("video_grid_thw")
+        mask = kwargs.get("mask")
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
@@ -86,8 +88,8 @@ class Model(Qwen3VLModel):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        vision_cache = kwargs.get("vision_cache", None)
-        cached = kwargs.get("cached_image_features", None)
+        vision_cache = kwargs.get("vision_cache")
+        cached = kwargs.get("cached_image_features")
         if cached is None and vision_cache is not None:
             cached = vision_cache.get(kwargs.get("_image_key"))
         if cached is not None:
@@ -143,11 +145,20 @@ class Model(Qwen3VLModel):
         return inputs_embeds, special_image_mask
 
     def sanitize(self, weights):
-        # The MTP draft shard is separate from the base model. Its presence
-        # must not select the base model's RMSNorm loading convention.
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
         weights = convert_qwen_fp8_weights(weights)
-        shift_norm_weights = should_shift_norm_weights(weights)
+        shift_norm_weights = any(
+            "conv1d.weight" in key and value.shape[-1] != 1
+            for key, value in weights.items()
+        )
+        has_mtp = any("mtp." in key for key in weights)
+        if self.config.text_config.mtp_num_hidden_layers > 0 and not has_mtp:
+            raise ValueError(
+                "Config enables MTP but checkpoint contains no MTP parameters"
+            )
+        if self.config.text_config.mtp_num_hidden_layers <= 0:
+            weights = {
+                key: value for key, value in weights.items() if "mtp." not in key
+            }
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -176,3 +187,9 @@ class Model(Qwen3VLModel):
     @property
     def cast_predicate(self):
         return self.language_model.cast_predicate
+
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+        return self.language_model.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()

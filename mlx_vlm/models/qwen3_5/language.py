@@ -1,5 +1,5 @@
-from functools import lru_cache, partial
-from typing import Any, List, Optional
+from functools import cache, lru_cache, partial
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -162,7 +162,7 @@ def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
     )
 
 
-def _target_verify_weight(weight: mx.array, x: mx.array) -> Optional[mx.array]:
+def _target_verify_weight(weight: mx.array, x: mx.array) -> mx.array | None:
     B, L, D = x.shape
     O = weight.shape[0]
     if O < 4 or O % 4 != 0 or D >= 16 * O or weight.dtype != x.dtype:
@@ -443,7 +443,7 @@ _TARGET_VERIFY_MASKED_QARGMAX_SOURCE = _TARGET_VERIFY_QARGMAX_SOURCE.replace(
 )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
@@ -458,7 +458,7 @@ def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size)
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
@@ -473,7 +473,7 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _target_verify_masked_qargmax_kernel(
     bits, group_size, dtype, verify_t, k_size, n_size
 ):
@@ -519,7 +519,7 @@ def _can_target_verify_quantized(linear, x: mx.array) -> bool:
     return x.shape[-1] == K
 
 
-def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
+def _target_verify_quantized_linear(linear, x: mx.array) -> mx.array | None:
     if not _can_target_verify_quantized(linear, x):
         return None
 
@@ -617,8 +617,8 @@ def _pad_token_mask_to_head(token_mask: mx.array, n_size: int) -> mx.array:
 
 
 def _target_verify_quantized_argmax(
-    linear, x: mx.array, token_mask: Optional[mx.array] = None
-) -> Optional[mx.array]:
+    linear, x: mx.array, token_mask: mx.array | None = None
+) -> mx.array | None:
     if not _can_target_verify_quantized(linear, x) or "bias" in linear:
         return None
 
@@ -928,8 +928,8 @@ def _gated_delta_update_verify_decode(
     b: mx.array,
     A_log: mx.array,
     dt_bias: mx.array,
-    state: Optional[mx.array],
-    mask: Optional[mx.array],
+    state: mx.array | None,
+    mask: mx.array | None,
     use_kernel: bool,
 ):
     return gated_delta_update_with_states(
@@ -1231,7 +1231,7 @@ def _qwen3_5_sdpa_vector_plan(seq_len: int, q_heads: int, kv_heads: int):
     return ("one_pass", 0)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _qwen3_5_ragged_sdpa_one_pass_kernel(dtype, d_size, v_size):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
@@ -1243,13 +1243,11 @@ def _qwen3_5_ragged_sdpa_one_pass_kernel(dtype, d_size, v_size):
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _qwen3_5_ragged_sdpa_two_pass_1_kernel(dtype, d_size, v_size, blocks):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
-        name=(
-            f"qwen3_5_ragged_sdpa_2p1_{dtype_name}_" f"d{d_size}_v{v_size}_b{blocks}"
-        ),
+        name=(f"qwen3_5_ragged_sdpa_2p1_{dtype_name}_d{d_size}_v{v_size}_b{blocks}"),
         input_names=["queries", "keys", "values", "pads", "scale", "k_size"],
         output_names=["partials", "sums", "maxs"],
         header="#include <metal_simdgroup>\nusing namespace metal;\n",
@@ -1257,7 +1255,7 @@ def _qwen3_5_ragged_sdpa_two_pass_1_kernel(dtype, d_size, v_size, blocks):
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _qwen3_5_ragged_sdpa_two_pass_2_kernel(dtype, v_size, blocks):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
@@ -1335,9 +1333,9 @@ def _qwen3_5_ragged_decode_attention(
     queries: mx.array,
     keys: mx.array,
     values: mx.array,
-    pads: List[int],
+    pads: list[int],
     scale: float,
-) -> Optional[mx.array]:
+) -> mx.array | None:
     # Metal-only fast path; on other backends (e.g. CUDA) return None so the
     # caller falls back to portable per-pad-group scaled_dot_product_attention.
     if not mx.metal.is_available():
@@ -1456,8 +1454,8 @@ def _target_verify_left_padded_attention(
     *,
     cache,
     scale: float,
-    mask: Optional[mx.array],
-) -> Optional[mx.array]:
+    mask: mx.array | None,
+) -> mx.array | None:
     if hasattr(cache, "bits") or queries.ndim != 4 or keys.ndim != 4:
         return None
 
@@ -1556,10 +1554,10 @@ class Qwen3_5Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        position_ids: Optional[mx.array] = None,
-        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
+        mask: mx.array | None = None,
+        cache: Any | None = None,
+        position_ids: mx.array | None = None,
+        position_embeddings: tuple[mx.array, mx.array] | None = None,
         target_verify: bool = False,
     ) -> mx.array:
         B, L, D = x.shape
@@ -1744,9 +1742,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        gdn_sink: Optional[list] = None,
+        mask: mx.array | None = None,
+        cache: Any | None = None,
+        gdn_sink: list | None = None,
         target_verify: bool = False,
     ) -> mx.array:
         B, S, _ = inputs.shape
@@ -1892,11 +1890,11 @@ class Qwen3_5DecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        position_ids: Optional[mx.array] = None,
-        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
-        gdn_sink: Optional[list] = None,
+        mask: mx.array | None = None,
+        cache: Any | None = None,
+        position_ids: mx.array | None = None,
+        position_embeddings: tuple[mx.array, mx.array] | None = None,
+        gdn_sink: list | None = None,
         target_verify: bool = False,
     ) -> mx.array:
         if self.is_linear:
@@ -1920,6 +1918,35 @@ class Qwen3_5DecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h), target_verify)
 
 
+class MTPDecoderLayer(Qwen3_5DecoderLayer):
+    """Full-attention Qwen3.5 decoder layer used by the vendor MTP head."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__(args, args.full_attention_interval - 1)
+
+
+class MTPModule(nn.Module):
+    """Vendor-trained native multi-token prediction head."""
+
+    def __init__(self, args: TextConfig, layer_type=MTPDecoderLayer):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.layers = [layer_type(args) for _ in range(args.mtp_num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(self, hidden_states, next_token_ids, embed_tokens, cache=None):
+        embedding = self.pre_fc_norm_embedding(embed_tokens(next_token_ids))
+        hidden = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(mx.concatenate([embedding, hidden], axis=-1))
+        cache = cache if cache is not None else [None] * len(self.layers)
+        mask = create_attention_mask(fused, cache[0]) if cache else None
+        for layer, layer_cache in zip(self.layers, cache):
+            fused = layer(fused, mask=mask, cache=layer_cache)
+        return self.norm(fused)
+
+
 class Qwen3_5Model(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -1936,13 +1963,13 @@ class Qwen3_5Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        inputs_embeds: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        inputs_embeds: mx.array | None = None,
+        mask: mx.array | None = None,
         cache=None,
-        position_ids: Optional[mx.array] = None,
-        capture_layer_ids: Optional[List[int]] = None,
-        hidden_sink: Optional[list] = None,
-        gdn_sink: Optional[list] = None,
+        position_ids: mx.array | None = None,
+        capture_layer_ids: list[int] | None = None,
+        hidden_sink: list | None = None,
+        gdn_sink: list | None = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -2097,7 +2124,12 @@ class Qwen3_5Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig, config: ModelConfig = None):
+    def __init__(
+        self,
+        args: TextConfig,
+        config: ModelConfig = None,
+        mtp_layer_type=MTPDecoderLayer,
+    ):
         super().__init__()
         self.args = args
         self.config = config
@@ -2108,6 +2140,23 @@ class LanguageModel(nn.Module):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MTPModule(args, mtp_layer_type)
+
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+        if not hasattr(self, "mtp"):
+            raise ValueError("MTP is disabled by model configuration")
+        mtp_out = self.mtp(
+            hidden_states, next_token_ids, self.model.embed_tokens, mtp_cache
+        )
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(mtp_out)
+        return self.lm_head(mtp_out)
+
+    def make_mtp_cache(self):
+        if not hasattr(self, "mtp"):
+            return []
+        return [KVCache() for _ in self.mtp.layers]
 
     def chunked_prefill_policy(
         self,
@@ -2133,8 +2182,8 @@ class LanguageModel(nn.Module):
 
     def rollback_speculative_cache(
         self,
-        caches: List[Any],
-        gdn_states: List,
+        caches: list[Any],
+        gdn_states: list,
         accepted,
         block_size: int,
     ) -> int:
@@ -2417,9 +2466,9 @@ class LanguageModel(nn.Module):
     def get_rope_index(
         self,
         input_ids: mx.array,
-        image_grid_thw: Optional[mx.array] = None,
-        video_grid_thw: Optional[mx.array] = None,
-        attention_mask: Optional[mx.array] = None,
+        image_grid_thw: mx.array | None = None,
+        video_grid_thw: mx.array | None = None,
+        attention_mask: mx.array | None = None,
     ):
         batch_size, seq_length = input_ids.shape
         position_ids = mx.arange(seq_length, dtype=mx.int32)
@@ -2594,8 +2643,8 @@ class LanguageModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        inputs_embeds: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        inputs_embeds: mx.array | None = None,
+        mask: mx.array | None = None,
         cache=None,
         **kwargs,
     ):
@@ -2739,10 +2788,10 @@ class LanguageModel(nn.Module):
                         position_ids, (3, batch_size, seq_length)
                     )
 
-        hidden_sink: Optional[List[mx.array]] = (
+        hidden_sink: list[mx.array] | None = (
             [] if capture_layer_ids is not None else None
         )
-        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
+        gdn_sink: list | None = [] if capture_layer_ids is not None else None
         target_verify = gdn_sink is not None
 
         out = self.model(
@@ -2782,7 +2831,7 @@ class LanguageModel(nn.Module):
             return out
         return self.lm_head(hidden)
 
-    def speculative_argmax_from_hidden(self, hidden: mx.array) -> Optional[mx.array]:
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array | None:
         if not self.args.tie_word_embeddings:
             out = _target_verify_quantized_argmax(self.lm_head, hidden)
             if out is not None:
@@ -2895,11 +2944,15 @@ class LanguageModel(nn.Module):
 
     @property
     def quant_predicate(self):
-
-        if getattr(self.args, "num_experts", 0) <= 0:
+        if (
+            getattr(self.args, "num_experts", 0) <= 0
+            and self.args.mtp_num_hidden_layers <= 0
+        ):
             return None
 
         def predicate(path, _):
+            if "mtp" in path.split("."):
+                return False
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
             return True

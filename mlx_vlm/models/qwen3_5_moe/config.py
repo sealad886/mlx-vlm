@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
 from ..qwen3_5.config import resolve_qwen_eos_token_id, sanitize_quantization_config
@@ -41,11 +40,11 @@ class TextConfig(BaseModelConfig):
     vocab_size: int
     num_key_value_heads: int
     max_position_embeddings: int
-    eos_token_id: Optional[Union[int, List[int]]] = None
+    eos_token_id: int | list[int] | None = None
     tie_word_embeddings: bool = False
     attention_bias: bool = False
-    head_dim: Optional[int] = None
-    rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
+    head_dim: int | None = None
+    rope_parameters: dict[str, float | str | bool | list[int]] | None = field(
         default_factory=lambda: {
             "type": "default",
             "mrope_section": [11, 11, 10],
@@ -54,6 +53,8 @@ class TextConfig(BaseModelConfig):
         }
     )
     full_attention_interval: int = 4
+    mtp_num_hidden_layers: int = 0
+    unsloth_fixed_mtp: bool = False
 
     def __post_init__(self):
         if self.rope_parameters:
@@ -82,14 +83,14 @@ class ModelConfig(BaseModelConfig):
     ignore_index: int = -100
     image_token_id: int = 248056
     video_token_id: int = 248057
-    image_token_index: Optional[int] = None
-    video_token_index: Optional[int] = None
+    image_token_index: int | None = None
+    video_token_index: int | None = None
     vision_start_token_id: int = 248045
     vision_end_token_id: int = 248046
     vocab_size: int = 248320
-    eos_token_id: Optional[Union[int, List[int]]] = None
-    quantization: Optional[Dict] = None
-    quantization_config: Optional[Dict] = None
+    eos_token_id: int | list[int] | None = None
+    quantization: dict | None = None
+    quantization_config: dict | None = None
 
     def __post_init__(self):
         if self.image_token_index is None:

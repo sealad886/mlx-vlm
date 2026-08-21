@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "upstream_url": "https://github.com/Blaizzy/mlx-vlm.git",
+  "upstream_commit": "1249c7db09921714b43e056b149f9d762eec07d3",
+  "local_commit": null,
+  "python": ">=3.12",
+  "ported_patches": [
+    "qwen3.5-native-mtp-module",
+    "qwen3.5-moe-mtp-fused-expert-normalization",
+    "qwen3.5-mtp-bf16-quantization-exclusion"
+  ]
+}
