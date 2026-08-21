@@ -2,7 +2,7 @@
   "schema_version": 1,
   "upstream_url": "https://github.com/Blaizzy/mlx-vlm.git",
   "upstream_commit": "1249c7db09921714b43e056b149f9d762eec07d3",
-  "local_commit": null,
+  "local_commit": "b239affeab980451bb9895957e0af295559b2217",
   "python": ">=3.12",
   "ported_patches": [
     "qwen3.5-native-mtp-module",
