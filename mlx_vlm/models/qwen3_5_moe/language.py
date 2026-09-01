@@ -125,7 +125,13 @@ class MTPMoeDecoderLayer(MTPDecoderLayer):
     """Full-attention MTP layer with the Qwen3.5 MoE feed-forward block."""
 
     def __init__(self, args: TextConfig):
-        super().__init__(args)
+        nn.Module.__init__(self)
+        self.is_linear = False
+        self.self_attn = Qwen3_5MoeAttention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
         self.mlp = Qwen3_5MoeSparseMoeBlock(args)
 
 
