@@ -3216,6 +3216,37 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
 
 
+def test_split_converted_integrated_qwen_mtp_preserves_effective_weights(tmp_path):
+    source = tmp_path / "converted"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    (source / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": text_config.to_dict()})
+    )
+    tensors = {
+        "language_model.mtp.fc.weight": mx.ones((16, 32)),
+        "language_model.mtp.pre_fc_norm_hidden.weight": mx.full((16,), 2.0),
+        "language_model.mtp.norm.weight": mx.full((16,), 3.0),
+        "language_model.model.norm.weight": mx.ones((16,)),
+    }
+    mx.save_safetensors(
+        str(source / "model.safetensors"), tensors, metadata={"format": "mlx"}
+    )
+
+    split_qwen3_5_mtp(str(source), str(output))
+
+    weights = mx.load(str(output / "model.safetensors"))
+    assert set(weights) == {"fc.weight", "pre_fc_norm_hidden.weight", "norm.weight"}
+    for key, value in weights.items():
+        assert mx.array_equal(value, tensors["language_model.mtp." + key]).item()
+    assert (
+        Qwen3_5MTPDraftModel.sanitize(None, dict(weights))["norm.weight"].tolist()
+        == [3.0] * 16
+    )
+
+
 def test_split_qwen3_5_mtp_converts_fine_grained_fp8(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"

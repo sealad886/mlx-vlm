@@ -33,6 +33,9 @@ NORM_WEIGHT_SUFFIXES = (
     "model.norm.weight",
     ".q_norm.weight",
     ".k_norm.weight",
+    ".pre_fc_norm_embedding.weight",
+    ".pre_fc_norm_hidden.weight",
+    "mtp.norm.weight",
 )
 
 

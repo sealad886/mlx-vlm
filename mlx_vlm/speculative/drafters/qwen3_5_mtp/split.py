@@ -29,15 +29,16 @@ class Qwen3_5MTPSplitter(MTPSplitter):
     depth_field = "mtp_num_hidden_layers"
     block_size_extra = 2
     supports_mlx_source = True
+    source_prefixes = ("mtp.", "language_model.mtp.")
 
     def select_keys(self, key: str, text_config: dict) -> bool:
-        return key.startswith("mtp.")
+        return key.startswith(self.source_prefixes)
 
     def on_mlx_source(
         self, tensors: Dict[str, mx.array], text_config: dict
     ) -> Dict[str, mx.array]:
         return {
-            (key[len("mtp.") :] if key.startswith("mtp.") else key): value
+            key.removeprefix("language_model.").removeprefix("mtp."): value
             for key, value in tensors.items()
         }
 
