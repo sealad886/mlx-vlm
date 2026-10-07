@@ -1940,7 +1940,7 @@ class MTPModule(nn.Module):
         embedding = self.pre_fc_norm_embedding(embed_tokens(next_token_ids))
         hidden = self.pre_fc_norm_hidden(hidden_states)
         fused = self.fc(mx.concatenate([embedding, hidden], axis=-1))
-        cache = cache if cache is not None else [None] * len(self.layers)
+        cache = cache if cache is not None else [KVCache() for _ in self.layers]
         mask = create_attention_mask(fused, cache[0]) if cache else None
         for layer, layer_cache in zip(self.layers, cache):
             fused = layer(fused, mask=mask, cache=layer_cache)

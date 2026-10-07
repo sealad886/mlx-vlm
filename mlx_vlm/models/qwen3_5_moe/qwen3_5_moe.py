@@ -68,20 +68,21 @@ class Model(Qwen3_5Model):
                     )
 
         for layer_index in range(mtp_num_hidden_layers):
-            prefix = f"mtp.layers.{layer_index}.mlp"
-            gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key in weights:
-                gate_up = weights.pop(gate_up_key)
-                midpoint = gate_up.shape[-2] // 2
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
-                    ..., :midpoint, :
-                ]
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
-                    ..., midpoint:, :
-                ]
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.experts.down_proj"
-                )
+            for namespace in ("mtp", "model.language_model.mtp", "language_model.mtp"):
+                prefix = f"{namespace}.layers.{layer_index}.mlp"
+                gate_up_key = f"{prefix}.experts.gate_up_proj"
+                if gate_up_key in weights:
+                    gate_up = weights.pop(gate_up_key)
+                    midpoint = gate_up.shape[-2] // 2
+                    weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
+                        ..., :midpoint, :
+                    ]
+                    weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
+                        ..., midpoint:, :
+                    ]
+                    weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                        f"{prefix}.experts.down_proj"
+                    )
 
         sanitized_weights = {}
         for key, value in weights.items():
