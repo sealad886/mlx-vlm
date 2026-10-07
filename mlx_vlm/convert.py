@@ -1,5 +1,4 @@
 import argparse
-import glob
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
