@@ -233,7 +233,7 @@ class MTPSplitter:
         depth = self.depth(text_config)
         draft_config = {
             "model_type": self.output_model_type,
-            "text_config": text_config,
+            "text_config": {**text_config, self.depth_field: depth},
             "block_size": int(block_size or depth + self.block_size_extra),
             "tie_word_embeddings": bool(
                 text_config.get("tie_word_embeddings", self.tie_word_embeddings_default)

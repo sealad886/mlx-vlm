@@ -6,6 +6,7 @@ import unittest
 
 import mlx.core as mx
 import mlx.nn as nn
+
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.qwen3_5.config import TextConfig as DenseConfig
 from mlx_vlm.models.qwen3_5.language import MTPModule
