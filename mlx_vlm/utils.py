@@ -38,6 +38,7 @@ MODEL_REMAPPING = {
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
     "jvlm": "jina_vlm",
+    "glm-image": "glm_image",
     "phi4-siglip": "phi4_siglip",
     "sam3_video": "sam3",
     "sam3.1_video": "sam3_1",
@@ -702,6 +703,119 @@ def get_model_path(
     return model_path
 
 
+def _is_supported_model_type(model_type: Optional[str]) -> bool:
+    if not isinstance(model_type, str):
+        return False
+
+    remapped_model_type = MODEL_REMAPPING.get(model_type.lower(), model_type.lower())
+    models_dir = Path(__file__).resolve().parent / "models"
+    return (models_dir / remapped_model_type).is_dir()
+
+
+def find_model_config_path(model_path: Union[str, Path]) -> Path:
+    """Find the most likely model ``config.json`` for a model directory.
+
+    Supports model snapshots where ``config.json`` lives in a nested folder
+    (for example ``vision_language_encoder/config.json``).
+    """
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
+
+    model_path = Path(model_path)
+    direct_config = model_path / "config.json"
+    if direct_config.exists():
+        return direct_config
+
+    candidates = []
+    for config_path in sorted(model_path.rglob("config.json")):
+        if config_path == direct_config:
+            continue
+
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(config, dict):
+            continue
+
+        score = 0
+        if "model_type" in config:
+            score += 5
+        if _is_supported_model_type(config.get("model_type")):
+            score += 10
+        if "architectures" in config:
+            score += 2
+        if list(config_path.parent.glob("*.safetensors")):
+            score += 6
+        if (config_path.parent / "model.safetensors.index.json").exists():
+            score += 4
+        if config_path.parent.name in {
+            "vision_language_encoder",
+            "language_model",
+            "model",
+        }:
+            score += 1
+
+        if score > 0:
+            candidates.append((score, -len(config_path.parts), config_path))
+
+    if not candidates:
+        raise FileNotFoundError(f"Config not found at {model_path}")
+
+    best_score = max((score, depth) for score, depth, _ in candidates)
+    best_paths = [
+        path for score, depth, path in candidates if (score, depth) == best_score
+    ]
+    if len(best_paths) != 1:
+        names = ", ".join(str(path.relative_to(model_path)) for path in best_paths)
+        raise ValueError(f"Ambiguous model configs at {model_path}: {names}")
+    return best_paths[0]
+
+
+def resolve_model_directory(model_path: Union[str, Path]) -> Path:
+    """Resolve the effective directory that contains model config and weights."""
+    return find_model_config_path(model_path).parent
+
+
+def _contains_processor_assets(path: Path) -> bool:
+    processor_files = {
+        "processor_config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+    }
+    return any((path / file_name).exists() for file_name in processor_files)
+
+
+def resolve_processor_directory(model_path: Union[str, Path]) -> Path:
+    """Resolve the directory that stores processor/tokenizer metadata."""
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
+
+    model_path = Path(model_path)
+    if _contains_processor_assets(model_path):
+        return model_path
+    resolved_model_path = resolve_model_directory(model_path)
+
+    candidates = [
+        model_path,
+        model_path / "processor",
+        resolved_model_path,
+        resolved_model_path / "processor",
+    ]
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_dir() and _contains_processor_assets(candidate):
+            return candidate
+
+    return model_path
+
+
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -725,7 +839,10 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     strict = kwargs.pop("strict", True)
+    model_path = Path(model_path)
     config = load_config(model_path, **kwargs)
+    if model_path.is_dir() and not (model_path / "config.json").is_file():
+        model_path = resolve_model_directory(model_path)
 
     index_file = model_path / "model.safetensors.index.json"
     weight_files = []
@@ -1159,10 +1276,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         )
 
     try:
-        with open(model_path / "config.json", encoding="utf-8") as f:
+        config_path = find_model_config_path(model_path)
+        with open(config_path, encoding="utf-8") as f:
             config = json.load(f)
 
-        generation_config_file = model_path / "generation_config.json"
+        generation_config_file = config_path.parent / "generation_config.json"
         if generation_config_file.exists():
             try:
                 with open(generation_config_file, encoding="utf-8") as f:
@@ -1209,9 +1327,22 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    processor_path = model_path
+    local_path = Path(model_path)
+    if local_path.is_dir():
+        processor_path = resolve_processor_directory(local_path)
+        config_path = find_model_config_path(local_path)
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("model_type") in {"glm_image", "glm-image"}:
+            from .models.glm_image import GlmImageProcessor
+
+            processor = GlmImageProcessor.from_pretrained(processor_path, **kwargs)
+        else:
+            processor = AutoProcessor.from_pretrained(processor_path, **kwargs)
+    else:
+        processor = AutoProcessor.from_pretrained(processor_path, **kwargs)
     if add_detokenizer:
-        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+        detokenizer_class = load_tokenizer(processor_path, return_tokenizer=False)
 
         # Get the tokenizer object
         tokenizer_obj = (
@@ -1904,7 +2035,12 @@ def prepare_inputs(
     has_videos = videos is not None and (
         not hasattr(videos, "__len__") or len(videos) > 0
     )
-    if not has_images and not has_audio and not has_videos:
+    if (
+        not has_images
+        and not has_audio
+        and not has_videos
+        and not getattr(processor, "requires_target_image_grid", False)
+    ):
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1932,6 +2068,9 @@ def prepare_inputs(
             "input_ids": input_ids,
             "attention_mask": mask,
         }
+
+    if not has_images:
+        images = None
 
     # Process images
     if images is not None:
