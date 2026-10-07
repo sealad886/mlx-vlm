@@ -1,5 +1,4 @@
 import argparse
-import glob
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -13,6 +12,8 @@ from .utils import (
     create_model_card,
     fetch_from_hub,
     get_model_path,
+    resolve_model_directory,
+    resolve_processor_directory,
     save_config,
     save_weights,
     skip_multimodal_module,
@@ -300,6 +301,8 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
+    resolved_model_path = resolve_model_directory(model_path)
+    processor_path = resolve_processor_directory(model_path)
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
@@ -382,17 +385,23 @@ def convert(
 
     save_weights(mlx_path, target, donate_weights=True)
 
-    # Copy Python and JSON files from the model path to the MLX path
-    for pattern in ["*.py", "*.json"]:
-        files = glob.glob(str(model_path / pattern))
-        for file in files:
-            # Skip the index file - save_weights() already generated the correct one
-            if Path(file).name == "model.safetensors.index.json":
-                continue
-            shutil.copy(file, mlx_path)
+    # Flatten metadata from nested model/processor snapshots. Model metadata
+    # owns duplicate names; never overwrite the newly generated shard index.
+    copied_files = set()
+    for source in dict.fromkeys((resolved_model_path, processor_path, model_path)):
+        for pattern in ("*.py", "*.json", "*.txt", "*.jinja", "*.model", "*.tiktoken"):
+            for file in source.glob(pattern):
+                if (
+                    file.name == "model.safetensors.index.json"
+                    or file.name in copied_files
+                ):
+                    continue
+                shutil.copy(file, mlx_path)
+                copied_files.add(file.name)
 
-    # Copy folders from the model path to the MLX path
-    for item in model_path.iterdir():
+    # Retain model-local sidecar directories, rather than copying all sibling
+    # diffusion components and original weight shards from a composite snapshot.
+    for item in resolved_model_path.iterdir():
         if item.is_dir():
             dest = mlx_path / item.name
             if dest.exists():
