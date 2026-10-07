@@ -10,6 +10,9 @@ from ....models.qwen3_5_moe.config import TextConfig as MoeTextConfig
 class TextConfig:
     @classmethod
     def from_dict(cls, params: dict):
+        # A standalone MTP checkpoint has one draft layer unless specified.
+        # Base-model configs independently default integrated MTP to disabled.
+        params = {"mtp_num_hidden_layers": 1, **params}
         text_config_cls = (
             MoeTextConfig if "moe" in params.get("model_type", "") else DenseTextConfig
         )

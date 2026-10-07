@@ -2901,6 +2901,66 @@ def test_eagle3_draft_vocab_mapping_uses_d2t_offsets():
     assert mapped.tolist() == [[0, 5, 15]]
 
 
+@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+@pytest.mark.parametrize("source_depth", [None, 0])
+def test_qwen3_5_mtp_missing_depth_loads_standalone_checkpoint(
+    tmp_path, model_type, source_depth
+):
+    text_config = _tiny_qwen3_5_text_config().to_dict()
+    text_config.pop("mtp_num_hidden_layers", None)
+    text_config["model_type"] = model_type
+    native_config_cls = qwen_language.TextConfig
+    if "moe" in model_type:
+        text_config.pop("intermediate_size")
+        text_config.update(
+            num_experts=2,
+            num_experts_per_tok=1,
+            shared_expert_intermediate_size=8,
+            moe_intermediate_size=8,
+        )
+        native_config_cls = importlib.import_module(
+            "mlx_vlm.models.qwen3_5_moe.config"
+        ).TextConfig
+    native_config = native_config_cls.from_dict(text_config)
+    assert native_config.mtp_num_hidden_layers == 0
+
+    explicit_config = {**text_config, "mtp_num_hidden_layers": 1}
+    source = Qwen3_5MTPDraftModel(
+        Qwen3_5MTPConfig.from_dict({"text_config": explicit_config})
+    )
+    config = Qwen3_5MTPConfig.from_dict({"text_config": text_config})
+    restored = Qwen3_5MTPDraftModel(config)
+    restored.load_weights(list(tree_flatten(source.parameters())), strict=True)
+    assert config.block_size == 3
+    assert len(restored.make_cache()) == 1
+    assert "mtp_num_hidden_layers" not in text_config
+
+    source_path = tmp_path / "source"
+    source_path.mkdir()
+    source_text_config = dict(text_config)
+    if source_depth is not None:
+        source_text_config["mtp_num_hidden_layers"] = source_depth
+    (source_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": source_text_config})
+    )
+    mx.save_safetensors(
+        str(source_path / "model.safetensors"),
+        {
+            f"language_model.mtp.{key}": value
+            for key, value in tree_flatten(source.parameters())
+        },
+        metadata={"format": "mlx"},
+    )
+    output = split_qwen3_5_mtp(str(source_path), str(tmp_path / "drafter"))
+    split_config = Qwen3_5MTPConfig.from_dict(
+        json.loads((output / "config.json").read_text())
+    )
+    split_model = Qwen3_5MTPDraftModel(split_config)
+    split_model.load_weights(str(output / "model.safetensors"), strict=True)
+    assert split_config.block_size == 3
+    assert len(split_model.make_cache()) == 1
+
+
 def test_qwen3_5_mtp_draft_block_smoke():
     text_config = _tiny_qwen3_5_text_config()
     text_config.mtp_num_hidden_layers = 1
