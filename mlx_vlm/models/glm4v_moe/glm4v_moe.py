@@ -6,17 +6,7 @@ import mlx.nn as nn
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
-from .processing import Glm46VMoEProcessor
 from .vision import VisionModel
-
-# Register the processor with the name expected by the model config
-try:
-    from transformers import AutoProcessor
-
-    # Register for both possible processor class names
-    AutoProcessor.register("Glm46VMoEProcessor", Glm46VMoEProcessor)
-except Exception as e:
-    print(f"Error registering glm4v_moe processor: {e}")
 
 
 class Model(nn.Module):
@@ -39,9 +29,7 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            # Reset position state for text-only generation
             self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
@@ -52,10 +40,14 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states = self.vision_tower(
+                pixel_values, grid_thw, output_hidden_states=False
+            )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(

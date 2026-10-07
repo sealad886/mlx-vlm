@@ -2,15 +2,16 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import ChunkedKVCache, KVCache
+from ..rope_utils import initialize_rope
+from ..switch_layers import SwitchGLU
 from .config import TextConfig
 
 
@@ -79,9 +80,16 @@ class Attention(nn.Module):
             keys = mx.fast.rms_norm(keys, weight=None, eps=1e-6)
 
         if self.attn_temperature_tuning and not self.use_rope:
+            # arange needs scalar offset
+            offset_scalar = offset
+            if isinstance(offset_scalar, mx.array):
+                offset_scalar = offset_scalar.max().item()
             attn_scales = (
                 mx.log(
-                    mx.floor(mx.arange(offset + 1, offset + L + 1) / self.floor_scale)
+                    mx.floor(
+                        mx.arange(offset_scalar + 1, offset_scalar + L + 1)
+                        / self.floor_scale
+                    )
                     + 1.0
                 )
                 * self.attn_scale
@@ -94,7 +102,7 @@ class Attention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         if self.use_rope and isinstance(mask, mx.array):
-            key_len = keys.shape[-2]
+            key_len = kv_sequence_length(keys)
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
 
@@ -238,10 +246,13 @@ class LlamaModel(nn.Module):
 
         if cache is not None:
             for idx, c in enumerate(cache):
-                if (idx + 1) % 4 != 0:
+                if (idx + 1) % 4 != 0 and hasattr(c, "maybe_trim_front"):
                     c.maybe_trim_front()
-            start = cache[0].start_position
+            start = getattr(cache[0], "start_position", 0)
             offset = cache[0].offset
+            # Handle array-valued offset from BatchKVCache
+            if isinstance(offset, mx.array):
+                offset = offset.max().item()
         else:
             start = 0
             offset = 0

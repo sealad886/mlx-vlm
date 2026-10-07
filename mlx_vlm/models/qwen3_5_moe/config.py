@@ -1,9 +1,9 @@
-import inspect
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
+from ..qwen3_5.config import resolve_qwen_eos_token_id, sanitize_quantization_config
 from ..qwen3_vl.config import VisionConfig as Qwen3VLVisionConfig
+from ..qwen3_vl.config import _config_kwargs, _maybe_deserialize_config
 
 
 @dataclass
@@ -40,10 +40,11 @@ class TextConfig(BaseModelConfig):
     vocab_size: int
     num_key_value_heads: int
     max_position_embeddings: int
+    eos_token_id: int | list[int] | None = None
     tie_word_embeddings: bool = False
     attention_bias: bool = False
-    head_dim: Optional[int] = None
-    rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
+    head_dim: int | None = None
+    rope_parameters: dict[str, float | str | bool | list[int]] | None = field(
         default_factory=lambda: {
             "type": "default",
             "mrope_section": [11, 11, 10],
@@ -52,6 +53,8 @@ class TextConfig(BaseModelConfig):
         }
     )
     full_attention_interval: int = 4
+    mtp_num_hidden_layers: int = 0
+    unsloth_fixed_mtp: bool = False
 
     def __post_init__(self):
         if self.rope_parameters:
@@ -80,26 +83,44 @@ class ModelConfig(BaseModelConfig):
     ignore_index: int = -100
     image_token_id: int = 248056
     video_token_id: int = 248057
-    image_token_index: Optional[int] = None
-    video_token_index: Optional[int] = None
+    image_token_index: int | None = None
+    video_token_index: int | None = None
     vision_start_token_id: int = 248045
     vision_end_token_id: int = 248046
     vocab_size: int = 248320
-    eos_token_id: Optional[List[int]] = None
+    eos_token_id: int | list[int] | None = None
+    quantization: dict | None = None
+    quantization_config: dict | None = None
 
     def __post_init__(self):
         if self.image_token_index is None:
             self.image_token_index = self.image_token_id
         if self.video_token_index is None:
             self.video_token_index = self.video_token_id
+        self.eos_token_id = resolve_qwen_eos_token_id(
+            self.eos_token_id, self.text_config
+        )
+        quantization = self.quantization
+        self.quantization = sanitize_quantization_config(quantization)
+        if self.quantization_config == quantization:
+            self.quantization_config = self.quantization
+        else:
+            self.quantization_config = sanitize_quantization_config(
+                self.quantization_config
+            )
 
     @classmethod
     def from_dict(cls, params):
-
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
+        # Deserialize nested configs before constructing ModelConfig.
+        # Without this, vision_config and text_config remain raw dicts
+        # and their dataclass defaults (e.g. patch_size=14) take precedence
+        # over the values in config.json (e.g. patch_size=16), causing
+        # reshape failures in the vision encoder.
+        params = dict(params)
+        params["vision_config"] = _maybe_deserialize_config(
+            VisionConfig, params.get("vision_config")
         )
+        params["text_config"] = _maybe_deserialize_config(
+            TextConfig, params.get("text_config"), require_all_fields=True
+        )
+        return cls(**_config_kwargs(cls, params))

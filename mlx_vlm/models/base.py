@@ -6,12 +6,49 @@ from typing import Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import (
-    create_attention_mask,
-    create_ssm_mask,
-    scaled_dot_product_attention,
-)
+import numpy as np
+from mlx.utils import tree_map
 from PIL import Image
+
+from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+from ..turboquant import _state_length as _turboquant_state_length
+from .cache import create_causal_mask
+
+
+def load_chat_template(tokenizer, model_path):
+    """Apply a chat template from the model directory to *tokenizer*."""
+    import json
+    from pathlib import Path
+
+    model_dir = Path(model_path)
+    chat_template_json = model_dir / "chat_template.json"
+    chat_template_jinja = model_dir / "chat_template.jinja"
+
+    if chat_template_json.exists():
+        template_data = json.loads(chat_template_json.read_text())
+        tokenizer.chat_template = template_data["chat_template"]
+    elif chat_template_jinja.exists():
+        tokenizer.chat_template = chat_template_jinja.read_text()
+
+    return tokenizer
+
+
+def to_mlx(data: dict) -> dict:
+    """Convert all array-like values in a processor output dict to mx.array."""
+    result = {}
+    for key, value in data.items():
+        if value is None or isinstance(value, mx.array):
+            result[key] = value
+        elif isinstance(value, np.ndarray):
+            result[key] = mx.array(value)
+        elif isinstance(value, list):
+            try:
+                result[key] = mx.array(np.array(value))
+            except (ValueError, TypeError):
+                result[key] = value
+        else:
+            result[key] = value
+    return result
 
 
 @dataclass
@@ -20,6 +57,13 @@ class LanguageModelOutput:
     hidden_states: Optional[List[mx.array]] = None
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
+    gdn_states: Optional[List] = None
+    shared_kv_states: Optional[Dict[str, tuple]] = None
+
+
+@dataclass
+class SequenceClassifierOutput:
+    logits: mx.array
 
 
 @dataclass
@@ -34,6 +78,9 @@ class InputEmbeddingsFeatures:
     full_text_row_masked_out_mask: Optional[mx.array] = None
     decoder_inputs_embeds: Optional[mx.array] = None
     attention_mask: Optional[mx.array] = None  # For encoder-decoder models
+    position_ids: Optional[mx.array] = None
+    pos_hw: Optional[mx.array] = None
+    rope_deltas: Optional[mx.array] = None
 
     def to_dict(self):
         return {
@@ -47,6 +94,9 @@ class InputEmbeddingsFeatures:
             "full_text_row_masked_out_mask": self.full_text_row_masked_out_mask,
             "decoder_inputs_embeds": self.decoder_inputs_embeds,
             "attention_mask": self.attention_mask,
+            "position_ids": self.position_ids,
+            "pos_hw": self.pos_hw,
+            "rope_deltas": self.rope_deltas,
         }
 
 
@@ -54,6 +104,8 @@ class InputEmbeddingsFeatures:
 class BaseModelConfig:
     @classmethod
     def from_dict(cls, params):
+        if not params:
+            return cls()
         return cls(
             **{
                 k: v
@@ -140,6 +192,185 @@ class BaseImageProcessor:
     @abstractmethod
     def preprocess(self, images):
         pass
+
+
+def kv_sequence_length(keys) -> int:
+    """Sequence length of ``keys`` as returned by ``cache.update_and_fetch``.
+
+    Unquantized caches return a plain ``[B, H, S, D]`` array. Uniform
+    quantized caches (``QuantizedKVCache``/``BatchQuantizedKVCache``) return
+    a ``(packed, scales, biases)`` tuple and TurboQuant caches return
+    codec-state named tuples.
+    """
+    if isinstance(keys, mx.array):
+        return keys.shape[-2]
+    # Plain tuple/list only: TurboQuant states are NamedTuples with a
+    # different layout and get measured by their own helper.
+    if type(keys) in (tuple, list):
+        return keys[0].shape[-2]
+    return _turboquant_state_length(keys)
+
+
+def create_attention_mask(
+    h, cache=None, window_size: Optional[int] = None, return_array: bool = False
+):
+    N = h.shape[1]
+    if (
+        cache is not None
+        and not isinstance(cache, mx.array)
+        and hasattr(cache, "make_mask")
+    ):
+        return cache.make_mask(N, return_array=return_array, window_size=window_size)
+    if N == 1:
+        return None
+    if return_array or (window_size and N > window_size):
+        return create_causal_mask(N, window_size=window_size)
+    return "causal"
+
+
+def create_ssm_mask(h, cache=None):
+    if (
+        cache is not None
+        and not isinstance(cache, mx.array)
+        and hasattr(cache, "make_mask")
+    ):
+        return cache.make_mask(h.shape[1])
+    return None
+
+
+def align_attention_mask_to_scores(mask, scores: mx.array):
+    """Broadcast an attention mask onto *scores* without mis-aligning batch vs heads.
+
+    Quantized GQA expands scores to 5D ``(B, n_kv_heads, n_repeats, L, K)`` while
+    batch left-pad masks are typically 4D ``(B, 1, L, K)``. Right-aligning those
+    shapes aliases ``B`` with ``n_kv_heads`` and crashes for multi-row batches
+    (see #1567). Insert singleton dims *before* the last two axes until ranks
+    match so the layout is ``(B, 1, …, 1, L, K)``.
+    """
+    if mask is None or isinstance(mask, str):
+        return mask
+
+    # Grow rank by inserting size-1 axes immediately before (L, K).
+    while mask.ndim < scores.ndim:
+        insert_at = max(mask.ndim - 2, 0)
+        mask = mx.expand_dims(mask, axis=insert_at)
+    return mask
+
+
+def quantized_scaled_dot_product_attention(
+    queries: mx.array,
+    q_keys: tuple[mx.array, mx.array, mx.array],
+    q_values: tuple[mx.array, mx.array, mx.array],
+    scale: float,
+    mask: Optional[mx.array],
+    group_size: int = 64,
+    bits: int = 8,
+) -> mx.array:
+    B, n_q_heads, L, D = queries.shape
+    n_kv_heads = q_keys[0].shape[-3]
+    n_repeats = n_q_heads // n_kv_heads
+
+    queries *= scale
+
+    if n_repeats > 1:
+        queries = mx.reshape(queries, (B, n_kv_heads, n_repeats, L, D))
+        q_keys = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_keys)
+        q_values = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_values)
+
+    scores = mx.quantized_matmul(
+        queries, *q_keys, transpose=True, group_size=group_size, bits=bits
+    )
+    if mask is not None:
+        if isinstance(mask, str):
+            qL, kL = scores.shape[-2:]
+            q_indices = mx.arange(kL - qL, kL)
+            k_indices = mx.arange(kL)
+            mask = q_indices[:, None] >= k_indices[None]
+        mask = align_attention_mask_to_scores(mask, scores)
+        if mask.dtype == mx.bool_:
+            scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+        else:
+            scores += mask
+    scores = mx.softmax(scores, axis=-1, precise=True)
+    out = mx.quantized_matmul(
+        scores, *q_values, transpose=False, group_size=group_size, bits=bits
+    )
+
+    if n_repeats > 1:
+        out = mx.reshape(out, (B, n_q_heads, L, D))
+
+    return out
+
+
+def scaled_dot_product_attention(
+    queries,
+    keys,
+    values,
+    cache,
+    scale: float,
+    mask: Optional[mx.array],
+    sinks: Optional[mx.array] = None,
+) -> mx.array:
+    if isinstance(cache, TurboQuantKVCache):
+        if sinks is not None:
+            raise ValueError("TurboQuant KV cache does not support attention sinks.")
+        if queries.shape[-2] == 1:
+            return cache.decode_attention(
+                queries,
+                keys_state=keys,
+                values_state=values,
+                scale=scale,
+                mask=mask,
+            )
+        result = cache.prefill_attention(
+            queries,
+            keys_state=keys,
+            values_state=values,
+            scale=scale,
+            mask=mask,
+        )
+        if result is not None:
+            return result
+        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
+    if isinstance(cache, BatchTurboQuantKVCache):
+        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
+    if hasattr(cache, "bits"):
+        if sinks is not None:
+            raise ValueError("Quantized SDPA does not support attention sinks.")
+        return quantized_scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            group_size=cache.group_size,
+            bits=cache.bits,
+        )
+
+    return mx.fast.scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        scale=scale,
+        mask=mask,
+        sinks=sinks,
+    )
 
 
 def expand2square(pil_img, background_color):
@@ -294,6 +525,19 @@ def chunked_attention(
     return mx.concatenate(outputs, axis=2)  # (B, n_heads, L, head_dim)
 
 
+@mx.compile
+def ensure_fused_sdpa(q, k, v, scale, mask=None):
+    fused_dims = (64, 80, 128)  # supported by MLX's fused SDPA kernel
+    d = q.shape[-1]
+    target = next((t for t in fused_dims if d <= t), d)
+    if target != d:
+        pad = [(0, 0)] * (q.ndim - 1) + [(0, target - d)]
+        q, k, v = mx.pad(q, pad), mx.pad(k, pad), mx.pad(v, pad)
+    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)[
+        ..., :d
+    ]
+
+
 def install_auto_processor_patch(target_model_types, processor_cls):
     """
     Install a composable patch on transformers.AutoProcessor.from_pretrained
@@ -344,6 +588,7 @@ def install_auto_processor_patch(target_model_types, processor_cls):
 
             model_type = str(cfg.get("model_type", "")).lower()
             if model_type in target_model_types:
+                kwargs.setdefault("trust_remote_code", True)
                 return processor_cls.from_pretrained(
                     pretrained_model_name_or_path, **kwargs
                 )
@@ -351,7 +596,7 @@ def install_auto_processor_patch(target_model_types, processor_cls):
             # On any failure, fall back to previous behavior
             pass
 
-        # Chain to the prior from_pretrained (which may already be patched)
+        # Chain to the prior from_pretrained
         return previous_from_pretrained.__func__(
             cls, pretrained_model_name_or_path, **kwargs
         )

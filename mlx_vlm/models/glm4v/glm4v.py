@@ -6,17 +6,7 @@ import mlx.nn as nn
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
-from .processing import Glm46VProcessor
 from .vision import VisionModel
-
-# Register the processor with the name expected by the model config
-try:
-    from transformers import AutoProcessor
-
-    # The model's preprocessor_config.json specifies "processor_class": "Glm46VProcessor"
-    AutoProcessor.register("Glm46VProcessor", Glm46VProcessor)
-except Exception as e:
-    print(f"Error registering glm4v processor: {e}")
 
 
 class Model(nn.Module):
@@ -38,9 +28,7 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            # Reset position state for text-only generation
             self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
@@ -51,21 +39,25 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states = self.vision_tower(
+                pixel_values, grid_thw, output_hidden_states=False
+            )
 
-        split_sizes = (
-            image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
-        ).tolist()
-        hidden_states = mx.split(
-            hidden_states, [split_sizes[0], sum(split_sizes[:2])], axis=0
-        )
+            split_sizes = (
+                image_grid_thw.prod(-1) // self.vision_tower.spatial_merge_size**2
+            ).tolist()
+            hidden_states = mx.split(
+                hidden_states, [split_sizes[0], sum(split_sizes[:2])], axis=0
+            )
 
-        hidden_states = mx.concatenate(hidden_states, axis=0).astype(
-            hidden_states[0].dtype
-        )
+            hidden_states = mx.concatenate(hidden_states, axis=0).astype(
+                hidden_states[0].dtype
+            )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(

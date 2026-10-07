@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from . import processing_qwen2_5_vl  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -22,16 +23,22 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
         if pixel_values is None:
-            # Reset position state for text-only generation
-            self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, attention_mask=mask
+            )
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids),
+                position_ids=position_ids,
+                rope_deltas=rope_deltas,
             )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -40,10 +47,14 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states = self.vision_tower(
-            pixel_values, grid_thw, output_hidden_states=False
-        )
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states = self.vision_tower(
+                pixel_values, grid_thw, output_hidden_states=False
+            )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self.merge_input_ids_with_image_features(
@@ -54,15 +65,15 @@ class Model(nn.Module):
             input_ids,
         )
 
-        # Pre-calculate position_ids for chunked prefill
-        if image_grid_thw is not None or video_grid_thw is not None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, mask
-            )
-            self.language_model._position_ids = position_ids
-            self.language_model._rope_deltas = rope_deltas
+        position_ids, rope_deltas = self.language_model.get_rope_index(
+            input_ids, image_grid_thw, video_grid_thw, mask
+        )
 
-        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
+        return InputEmbeddingsFeatures(
+            inputs_embeds=final_inputs_embeds,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(

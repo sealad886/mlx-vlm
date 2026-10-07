@@ -7,6 +7,7 @@ import numpy as np
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -125,14 +126,19 @@ def apply_rotary_pos_emb(
         cos: Cosine values with shape (seq_len, head_dim)
         sin: Sine values with shape (seq_len, head_dim)
     """
+    origin_dtype = q.dtype
+
     # Expand cos/sin to (1, 1, seq_len, head_dim) for broadcasting
     cos = cos[None, None, :, :]
     sin = sin[None, None, :, :]
 
+    q, k = q.astype(mx.float32), k.astype(mx.float32)
+    cos, sin = cos.astype(mx.float32), sin.astype(mx.float32)
+
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
 
-    return q_embed, k_embed
+    return q_embed.astype(origin_dtype), k_embed.astype(origin_dtype)
 
 
 class Attention(nn.Module):
@@ -199,15 +205,24 @@ class Attention(nn.Module):
         )
 
         kv_seq_len = L
-        offset = 0
+        offset_scalar = 0
         if cache is not None:
-            offset = cache.offset
-            kv_seq_len += offset
+            # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
+            if hasattr(cache, "_idx"):
+                offset_scalar = int(cache._idx)
+            else:
+                off = cache.offset
+                offset_scalar = (
+                    int(off)
+                    if isinstance(off, int)
+                    else (int(off.max().item()) if off.ndim > 0 else int(off.item()))
+                )
+            kv_seq_len += offset_scalar
 
         cos, sin = self.rotary_emb(values, seq_len=kv_seq_len)
 
         # Apply rotary embeddings
-        if self.xdrope_section is not None and (cache is None or offset == 0):
+        if self.xdrope_section is not None and (cache is None or offset_scalar == 0):
             # XD RoPE for prefill (first forward pass)
             output_size = (B, self.n_heads, L, L)
             queries, keys = apply_rotary_pos_emb_xdrope(
@@ -221,7 +236,7 @@ class Attention(nn.Module):
             )
         else:
             # Standard RoPE for decode (subsequent tokens)
-            if cache is not None and offset > 0:
+            if cache is not None and offset_scalar > 0:
                 cos = cos[-L:]
                 sin = sin[-L:]
             queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
@@ -237,7 +252,7 @@ class Attention(nn.Module):
 
         # Apply mask
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
+            mask = mask[..., : kv_sequence_length(keys)]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -472,12 +487,20 @@ class LanguageModel(nn.Module):
                 ]
             elif inputs is not None:
                 # Compute position_ids on the fly (for non-chunked prefill)
-                position_ids = self.get_xdrope_input_positions(
-                    input_tokens=inputs[0].tolist(),
-                    image_grid_thw=kwargs.get("image_grid_thw", None),
-                    image_token_id=self.config.image_token_id,
-                    spatial_merge_size=self.config.vision_config.spatial_merge_size,
-                )[None, ...]
+                position_ids = mx.stack(
+                    [
+                        self.get_xdrope_input_positions(
+                            input_tokens=row,
+                            image_grid_thw=kwargs.get("image_grid_thw", None),
+                            image_token_id=self.config.image_token_id,
+                            spatial_merge_size=(
+                                self.config.vision_config.spatial_merge_size
+                            ),
+                        )
+                        for row in inputs.tolist()
+                    ],
+                    axis=0,
+                )
                 # Store for potential future chunks
                 self._position_ids = position_ids
 

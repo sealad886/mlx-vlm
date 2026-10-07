@@ -1,18 +1,58 @@
-from typing import Optional
-
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
 from ..qwen3_vl import Model as Qwen3VLModel
+from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
 from ..qwen3_vl.qwen3_vl import masked_scatter
 from .config import ModelConfig
+from .fp8 import convert_qwen_fp8_weights
 from .language import LanguageModel
 from .vision import VisionModel
 
 
-class Model(Qwen3VLModel):
+def sanitize_key(key):
+    if key.startswith("mtp."):
+        key = key.replace("mtp", "language_model.mtp", 1)
+    elif key.startswith("model.language_model.mtp"):
+        key = key.replace("model.language_model.mtp", "language_model.mtp", 1)
+    elif key.startswith("model.language_model.visual"):
+        key = key.replace("model.language_model.visual", "vision_tower", 1)
+    elif key.startswith("model.language_model"):
+        key = key.replace("model.language_model", "language_model.model", 1)
+    elif key.startswith("model.visual"):
+        key = key.replace("model.visual", "vision_tower", 1)
+    elif key.startswith("lm_head"):
+        key = key.replace("lm_head", "language_model.lm_head", 1)
+    return key
 
+
+NORM_WEIGHT_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+    ".pre_fc_norm_embedding.weight",
+    ".pre_fc_norm_hidden.weight",
+    "mtp.norm.weight",
+)
+
+
+def should_shift_norm_weights(weights):
+    has_mtp_weights = any("mtp." in key for key in weights)
+    has_unsanitized_conv1d = any(
+        "conv1d.weight" in key and value.shape[-1] != 1
+        for key, value in weights.items()
+    )
+    return has_mtp_weights or has_unsanitized_conv1d
+
+
+def should_offset_norm_weight(original_key, shift_norm_weights):
+    return shift_norm_weights or not original_key.startswith("language_model.")
+
+
+class Model(Qwen3VLModel):
     def __init__(self, config: ModelConfig):
         # only initialize nn.Module, skip the initialization of vision_tower and language_model in the parent class
         nn.Module.__init__(self)
@@ -22,21 +62,26 @@ class Model(Qwen3VLModel):
 
     def get_input_embeddings(
         self,
-        input_ids: Optional[mx.array] = None,
-        pixel_values: Optional[mx.array] = None,
+        input_ids: mx.array | None = None,
+        pixel_values: mx.array | None = None,
         **kwargs,
     ):
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos")
+
+        image_grid_thw = kwargs.get("image_grid_thw")
+        video_grid_thw = kwargs.get("video_grid_thw")
+        mask = kwargs.get("mask")
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            # Reset position state for text-only generation
-            self.language_model._position_ids = None
-            self.language_model._rope_deltas = None
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, attention_mask=mask
+            )
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids),
+                position_ids=position_ids,
+                rope_deltas=rope_deltas,
             )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -45,8 +90,18 @@ class Model(Qwen3VLModel):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
+        vision_cache = kwargs.get("vision_cache")
+        cached = kwargs.get("cached_image_features")
+        if cached is None and vision_cache is not None:
+            cached = vision_cache.get(kwargs.get("_image_key"))
+        if cached is not None:
+            hidden_states = cached
+        else:
+            # Get the ouptut hidden states from the vision model
+            hidden_states, _ = self.vision_tower(pixel_values, grid_thw)
+            if vision_cache is not None and kwargs.get("_image_key") is not None:
+                mx.eval(hidden_states)
+                vision_cache.put(kwargs["_image_key"], hidden_states)
 
         # Insert special image tokens in the input_ids
         inputs_embeds, _ = self.merge_input_ids_with_image_features(
@@ -57,16 +112,14 @@ class Model(Qwen3VLModel):
             self.config.video_token_index,
         )
 
-        # Pre-calculate position_ids for chunked prefill
-        if image_grid_thw is not None or video_grid_thw is not None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, mask
-            )
-            self.language_model._position_ids = position_ids
-            self.language_model._rope_deltas = rope_deltas
+        position_ids, rope_deltas = self.language_model.get_rope_index(
+            input_ids, image_grid_thw, video_grid_thw, mask
+        )
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
         )
 
     @staticmethod
@@ -94,34 +147,38 @@ class Model(Qwen3VLModel):
         return inputs_embeds, special_image_mask
 
     def sanitize(self, weights):
-        # ignore mtp weights
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
+        weights = convert_qwen_fp8_weights(weights)
+        shift_norm_weights = any(
+            "conv1d.weight" in key and value.shape[-1] != 1
+            for key, value in weights.items()
+        )
+        has_mtp = any("mtp." in key for key in weights)
+        mtp_num_hidden_layers = getattr(
+            self.config.text_config, "mtp_num_hidden_layers", 0
+        )
+        if mtp_num_hidden_layers > 0 and not has_mtp:
+            raise ValueError(
+                "Config enables MTP but checkpoint contains no MTP parameters"
+            )
+        if mtp_num_hidden_layers <= 0:
+            weights = {
+                key: value for key, value in weights.items() if "mtp." not in key
+            }
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
-
         sanitized_weights = {}
         for key, value in weights.items():
-            if "model" in key:
-                if "model.language_model" in key:
-                    key = key.replace("model.language_model", "language_model.model")
-                elif "model.visual" in key:
-                    key = key.replace("model.visual", "vision_tower")
-            elif "lm_head" in key:
-                key = key.replace("lm_head", "language_model.lm_head")
+            original_key = key
+            key = sanitize_key(key)
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
-            if any(key.endswith(sfx) for sfx in norm_keys):
-                if value.ndim == 1:
+            if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
+                if value.ndim == 1 and should_offset_norm_weight(
+                    original_key, shift_norm_weights
+                ):
                     value += 1.0
 
             sanitized_weights[key] = value
@@ -135,3 +192,9 @@ class Model(Qwen3VLModel):
     @property
     def cast_predicate(self):
         return self.language_model.cast_predicate
+
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+        return self.language_model.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()

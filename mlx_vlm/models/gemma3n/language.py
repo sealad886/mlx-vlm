@@ -8,9 +8,11 @@ import mlx.nn as nn
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -106,12 +108,14 @@ class Gemma3nAttention(nn.Module):
 
         self.is_kv_shared_layer = is_kv_shared_layer
 
-        self.rope = nn.RoPE(
-            head_dim,
+        self.rope = initialize_rope(
+            dims=head_dim,
             traditional=False,
             base=(
                 config.rope_local_base_freq if self.is_sliding else config.rope_theta
             ),
+            scaling_config=None if self.is_sliding else config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(
@@ -128,14 +132,16 @@ class Gemma3nAttention(nn.Module):
 
         offset = 0
         if self.is_kv_shared_layer and cache is not None:
-            # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.state
+            state = cache.state
+            keys, values = state[0], state[1]
             offset = cache.offset
 
         else:
 
             if cache is not None:
                 offset = cache.offset
+                if isinstance(offset, mx.array):
+                    offset = mx.array(offset)
 
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
@@ -152,8 +158,10 @@ class Gemma3nAttention(nn.Module):
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
 
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[:, : keys.shape[-2]]
+        if isinstance(mask, mx.array):
+            key_len = kv_sequence_length(keys)
+            if mask.shape[-1] != key_len:
+                mask = mask[:, :key_len]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -280,8 +288,8 @@ class Gemma3nAltUp(nn.Module):
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
 
-        all_coefs = all_coefs.transpose(2, 1, 0)
-        corrected = innovation[None] * all_coefs[:, None]
+        all_coefs = all_coefs.transpose(2, 0, 1)[..., None]
+        corrected = innovation[None] * all_coefs
         corrected += predictions
 
         return corrected.astype(activated.dtype)
@@ -478,14 +486,29 @@ class Gemma3Model(nn.Module):
             if target_len != h.shape[1]:
                 target_len = h.shape[1]
 
-            cache_offset = next(
-                (
-                    int(c.offset)
-                    for c in (cache or [])
-                    if c is not None and hasattr(c, "offset")
-                ),
-                0,
+            c0 = next(
+                (c for c in (cache or []) if c is not None and hasattr(c, "_idx")),
+                None,
             )
+            if c0 is not None:
+                cache_offset = int(c0._idx)
+            else:
+                raw_offset = next(
+                    (
+                        c.offset
+                        for c in (cache or [])
+                        if c is not None and hasattr(c, "offset")
+                    ),
+                    0,
+                )
+                if isinstance(raw_offset, mx.array):
+                    cache_offset = (
+                        int(raw_offset.max().item())
+                        if raw_offset.size > 1
+                        else int(raw_offset.item())
+                    )
+                else:
+                    cache_offset = int(raw_offset)
             max_start = max(per_layer_inputs.shape[1] - target_len, 0)
             start = min(cache_offset, max_start)
             per_layer_inputs = per_layer_inputs[:, start : start + target_len]
@@ -498,11 +521,12 @@ class Gemma3Model(nn.Module):
         if mask is None:
             full_mask = create_attention_mask(
                 h,
-                cache[self.first_full_idx :],
+                cache[self.first_full_idx],
             )
             sliding_window_mask = create_attention_mask(
                 h,
-                cache[self.first_sliding_idx :],
+                cache[self.first_sliding_idx],
+                window_size=self.config.sliding_window,
             )
         h0 = h
 

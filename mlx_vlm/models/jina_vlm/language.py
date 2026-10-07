@@ -4,10 +4,13 @@ from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache
 
-from ..base import LanguageModelOutput
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
+from ..cache import KVCache
 from .config import TextConfig
 
 
@@ -36,6 +39,9 @@ class RoPE(nn.Module):
 
     def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
         seq_len = x.shape[2]
+        # Handle array-valued offset from BatchKVCache
+        if isinstance(offset, mx.array):
+            offset = offset.max().item()
         positions = mx.arange(offset, offset + seq_len).astype(mx.float32)
         freqs = positions[:, None] * self._inv_freq[None, :]
         emb = mx.concatenate([freqs, freqs], axis=-1)
@@ -262,7 +268,8 @@ class LanguageModel(nn.Module):
             cache = [None] * len(self.layers)
 
         # Create causal attention mask
-        mask = create_attention_mask(x, cache)
+        if mask is None:
+            mask = create_attention_mask(x, cache)
 
         for i, layer in enumerate(self.layers):
             x = layer(x, mask=mask, cache=cache[i])

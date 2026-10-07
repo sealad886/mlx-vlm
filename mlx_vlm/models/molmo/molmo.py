@@ -55,7 +55,12 @@ class Model(nn.Module):
                 else None
             )
 
-        image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+            cls_embed = None
+        else:
+            image_features, cls_embed = self.vision_tower(pixel_values, image_masks)
 
         # Insert image features into the input embeddings
         num_image, num_patch = image_features.shape[1:3]
@@ -64,14 +69,17 @@ class Model(nn.Module):
         image_features = image_features.reshape(batch_size, num_image * num_patch, -1)
         image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
 
-        valid = np.where(image_input_idx >= 0)[0].tolist()
-        batch_idx = mx.arange(batch_size)
-        batch_idx = mx.tile(batch_idx[:, None], [1, image_features.shape[1]])
+        # Scatter each valid patch feature into its token position. Padded slots
+        # (image_input_idx < 0) must be skipped: negative indices would wrap
+        # around and corrupt embeddings near the end of the sequence.
+        idx = np.asarray(image_input_idx)
+        batch_rows, patch_cols = np.nonzero(idx >= 0)
+        token_positions = idx[batch_rows, patch_cols]
 
         input_embeddings = self.language_model.model.wte(input_ids)
-        input_embeddings[batch_idx[valid], image_input_idx[valid]] += image_features[
-            valid
-        ]
+        input_embeddings[
+            mx.array(batch_rows), mx.array(token_positions)
+        ] += image_features[mx.array(batch_rows), mx.array(patch_cols)]
 
         return InputEmbeddingsFeatures(inputs_embeds=input_embeddings)
 

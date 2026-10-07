@@ -3,10 +3,10 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.rope_utils import SuScaledRoPE
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
+from ..rope_utils import SuScaledRoPE
 
 # Import processor to register it with AutoProcessor
 from . import processing_phi3_v  # noqa: F401
@@ -212,12 +212,20 @@ class Model(nn.Module):
         p = np.argwhere(np.array(inputs_list) < 0).tolist()
 
         if pixel_values is not None:
-            if pixel_values.dtype != inputs_embeds.dtype:
-                pixel_values = pixel_values.astype(inputs_embeds.dtype)
+            cached = kwargs.get("cached_image_features", None) if kwargs else None
+            if cached is not None:
+                # Replace image token positions with cached features
+                for positions in p:
+                    for pos_idx, pos in enumerate(positions):
+                        if pos_idx < cached.shape[0]:
+                            inputs_embeds[0, pos] = cached[pos_idx]
+            else:
+                if pixel_values.dtype != inputs_embeds.dtype:
+                    pixel_values = pixel_values.astype(inputs_embeds.dtype)
 
-            inputs_embeds = self.model.vision_embed_tokens(
-                pixel_values, inputs_embeds, image_sizes, p
-            )
+                inputs_embeds = self.model.vision_embed_tokens(
+                    pixel_values, inputs_embeds, image_sizes, p
+                )
 
         return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 

@@ -49,14 +49,22 @@ class Model(nn.Module):
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
 
-        # Cast pixel_values to model dtype for consistent dtype propagation
-        model_dtype = self.language_model.model.embed_tokens.weight.dtype
+        # Cast pixel_values to the vision tower's patch-embed dtype so the
+        # cast remains a float type when the language model is quantized
+        # (embed_tokens.weight is then a packed uint32 storage tensor; casting
+        # pixel_values to it crashes mx.conv2d). Mirrors the qwen2_vl convention.
+        patch_embed = self.vision_tower.vision_model.patch_embed
+        model_dtype = patch_embed.blocks[0].reparam_conv.weight.dtype
         pixel_values = pixel_values.astype(model_dtype)
 
-        _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
-        B, H, W, C = image_features.shape
-        image_features = image_features.reshape(B, H * W, C)
-        image_features = self.mm_projector(image_features)
+        cached = kwargs.get("cached_image_features", None)
+        if cached is not None:
+            image_features = cached
+        else:
+            _, image_features, _ = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
+            B, H, W, C = image_features.shape
+            image_features = image_features.reshape(B, H * W, C)
+            image_features = self.mm_projector(image_features)
 
         final_inputs_embeds = self.prepare_inputs_for_multimodal(
             image_features, input_ids, mask
@@ -204,11 +212,11 @@ class Model(nn.Module):
                     )
                     key = key.replace("patch_embed", "patch_embed.blocks")
                 return key
-            if "lm_head" in key:
-                return key
             if "mm_projector" in key:
                 return key.replace("model.", "")
             if "language_model" not in key:
+                # Includes lm_head.weight on untied checkpoints (e.g. 7B);
+                # LanguageModel.sanitize handles dropping it for tied configs.
                 return "language_model." + key
             return key
 

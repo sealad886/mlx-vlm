@@ -4,15 +4,14 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from transformers import AutoProcessor
 
-from ..base import InputEmbeddingsFeatures
+from ..base import InputEmbeddingsFeatures, install_auto_processor_patch
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel
 from .processing_jinavlm import JinaVLMProcessor
 from .vision import VisionModel
 
-AutoProcessor.register("jvlm", JinaVLMProcessor)
+install_auto_processor_patch("jvlm", JinaVLMProcessor)
 
 
 class CrossAttention(nn.Module):
@@ -227,7 +226,11 @@ class Model(nn.Module):
                     else None
                 )
 
-            image_features = self.get_image_features(pixel_values, image_masks)
+            cached = kwargs.get("cached_image_features", None)
+            if cached is not None:
+                image_features = cached
+            else:
+                image_features = self.get_image_features(pixel_values, image_masks)
 
             num_image, num_patch = image_features.shape[1:3]
 

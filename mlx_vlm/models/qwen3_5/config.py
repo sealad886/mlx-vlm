@@ -1,9 +1,45 @@
-import inspect
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
 from ..qwen3_vl.config import VisionConfig as Qwen3VLVisionConfig
+from ..qwen3_vl.config import _config_kwargs, _maybe_deserialize_config
+
+QWEN_CHAT_EOS_TOKEN_ID = 248046
+
+
+def sanitize_quantization_config(quantization):
+    if not isinstance(quantization, dict):
+        return quantization
+
+    from .qwen3_5 import sanitize_key
+
+    sanitized = {}
+    for key, value in quantization.items():
+        sanitized[sanitize_key(key)] = value
+    return sanitized
+
+
+def resolve_qwen_eos_token_id(eos_token_id, text_config):
+    if eos_token_id is not None:
+        return eos_token_id
+
+    if isinstance(text_config, dict):
+        text_eos = text_config.get("eos_token_id")
+    else:
+        text_eos = text_config.eos_token_id
+
+    if text_eos is None:
+        return None
+
+    if isinstance(text_eos, list):
+        eos_values = [int(token_id) for token_id in text_eos]
+    else:
+        eos_values = [int(text_eos)]
+
+    if QWEN_CHAT_EOS_TOKEN_ID not in eos_values:
+        eos_values.append(QWEN_CHAT_EOS_TOKEN_ID)
+
+    return eos_values
 
 
 @dataclass
@@ -37,10 +73,11 @@ class TextConfig(BaseModelConfig):
     vocab_size: int
     num_key_value_heads: int
     max_position_embeddings: int
+    eos_token_id: int | list[int] | None = None
     tie_word_embeddings: bool = False
     attention_bias: bool = False
-    head_dim: Optional[int] = None
-    rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
+    head_dim: int | None = None
+    rope_parameters: dict[str, float | str | bool | list[int]] | None = field(
         default_factory=lambda: {
             "type": "default",
             "mrope_section": [11, 11, 10],
@@ -49,6 +86,8 @@ class TextConfig(BaseModelConfig):
         }
     )
     full_attention_interval: int = 4
+    mtp_num_hidden_layers: int = 0
+    unsloth_fixed_mtp: bool = False
 
     def __post_init__(self):
         if self.rope_parameters:
@@ -77,25 +116,39 @@ class ModelConfig(BaseModelConfig):
     ignore_index: int = -100
     image_token_id: int = 248056
     video_token_id: int = 248057
-    image_token_index: Optional[int] = None
-    video_token_index: Optional[int] = None
+    image_token_index: int | None = None
+    video_token_index: int | None = None
     vision_start_token_id: int = 248045
     vision_end_token_id: int = 248046
     vocab_size: int = 248320
-    eos_token_id: Optional[List[int]] = None
+    eos_token_id: int | list[int] | None = None
+    quantization: dict | None = None
+    quantization_config: dict | None = None
 
     def __post_init__(self):
         if self.image_token_index is None:
             self.image_token_index = self.image_token_id
         if self.video_token_index is None:
             self.video_token_index = self.video_token_id
+        self.eos_token_id = resolve_qwen_eos_token_id(
+            self.eos_token_id, self.text_config
+        )
+        quantization = self.quantization
+        self.quantization = sanitize_quantization_config(quantization)
+        if self.quantization_config == quantization:
+            self.quantization_config = self.quantization
+        else:
+            self.quantization_config = sanitize_quantization_config(
+                self.quantization_config
+            )
 
     @classmethod
     def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
+        params = dict(params)
+        params["vision_config"] = _maybe_deserialize_config(
+            VisionConfig, params.get("vision_config")
         )
+        params["text_config"] = _maybe_deserialize_config(
+            TextConfig, params.get("text_config"), require_all_fields=True
+        )
+        return cls(**_config_kwargs(cls, params))

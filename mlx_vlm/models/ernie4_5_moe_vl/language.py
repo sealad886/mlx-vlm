@@ -4,14 +4,20 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import (
+    apply_rotary_pos_emb_even_odd,
+    compute_selected_mrope_cos_sin,
+    mrope_section_selectors,
+)
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
 
 
@@ -50,43 +56,11 @@ class Ernie4_5RotaryEmbedding:
             ]
         )
         self.inv_freq = inv_freq_3d
-
-    def _recomposition_to_3d(self, freq):
-        """Recompose frequencies for 3D positions matching PyTorch's approach.
-
-        Args:
-            freq: [3, batch, seq_len, dim//2] - frequencies for T, H, W dimensions
-
-        Returns:
-            Recomposed frequencies [batch, seq_len, dim]
-        """
-        # Split by mrope_section
-        h_dim, w_dim, t_dim = self.mrope_section
-
-        # freq shape: [3, batch, seq_len, half_dim]
-        # Split each dimension's frequencies
-        freq_parts = []
-        for i in range(3):
-            freq_parts.append(mx.split(freq[i], [h_dim, h_dim + w_dim], axis=-1))
-
-        # Recompose: freq_h from dim 1, freq_w from dim 2, freq_t from dim 0
-        # This matches PyTorch's (i + 1) % 3 indexing
-        freq_h = freq_parts[1][0]  # H from position 1
-        freq_w = freq_parts[2][1]  # W from position 2
-        freq_t = freq_parts[0][2]  # T from position 0
-
-        # Interleave H and W: [h0, w0, h1, w1, ...]
-        freq_hw = mx.stack([freq_h, freq_w], axis=-1).reshape(
-            freq_h.shape[0], freq_h.shape[1], -1
+        self.position_selector, self.frequency_selector = mrope_section_selectors(
+            self.mrope_section,
+            position_axes=(1, 2, 0),
+            interleave_sections=(0, 1),
         )
-
-        # Concatenate HW and T
-        freq_hwt = mx.concatenate([freq_hw, freq_t], axis=-1)
-
-        # Repeat interleave by 2 for full head_dim
-        freq_full = mx.repeat(freq_hwt, 2, axis=-1)
-
-        return freq_full
 
     def __call__(self, x, position_ids):
         """
@@ -103,43 +77,17 @@ class Ernie4_5RotaryEmbedding:
             # 1D positions - expand to 3D with same values
             position_ids = mx.stack([position_ids, position_ids, position_ids], axis=-1)
 
-        batch_size, seq_len, _ = position_ids.shape
-
         # position_ids: [batch, seq_len, 3] -> [3, batch, seq_len]
         position_ids = position_ids.transpose(2, 0, 1).astype(mx.float32)
 
-        # inv_freq: [dim//2] -> [1, 1, dim//2, 1] for broadcasting
-        inv_freq_expanded = self.inv_freq[None, None, :, None]  # [1, 1, dim//2, 1]
-        inv_freq_expanded = mx.broadcast_to(
-            inv_freq_expanded, (3, batch_size, self.dim // 2, 1)
+        cos, sin = compute_selected_mrope_cos_sin(
+            position_ids,
+            self.inv_freq,
+            self.position_selector,
+            self.frequency_selector,
         )
 
-        # position_ids: [3, batch, seq_len] -> [3, batch, 1, seq_len]
-        position_ids_expanded = position_ids[:, :, None, :]
-
-        # freqs: [3, batch, dim//2, seq_len] -> [3, batch, seq_len, dim//2]
-        freqs = (inv_freq_expanded * position_ids_expanded).transpose(0, 1, 3, 2)
-
-        cos = mx.cos(freqs)
-        sin = mx.sin(freqs)
-
-        # Recompose to 3D
-        cos = self._recomposition_to_3d(cos)
-        sin = self._recomposition_to_3d(sin)
-
         return cos.astype(x.dtype), sin.astype(x.dtype)
-
-
-def rotate_half_interleaved(x):
-    """Rotates using interleaved pattern: [-x1, x0, -x3, x2, ...].
-
-    This matches PyTorch's rotation: stack([-x[1::2], x[0::2]], dim=-1).reshape()
-    """
-    x_even = x[..., 0::2]  # [x0, x2, x4, ...]
-    x_odd = x[..., 1::2]  # [x1, x3, x5, ...]
-    # Stack as [-odd, even] and reshape
-    rotated = mx.stack([-x_odd, x_even], axis=-1)
-    return rotated.reshape(x.shape)
 
 
 def apply_rotary_pos_emb(q, k, cos_pos, sin_pos):
@@ -153,24 +101,7 @@ def apply_rotary_pos_emb(q, k, cos_pos, sin_pos):
         cos_pos: [batch, seq_len, head_dim]
         sin_pos: [batch, seq_len, head_dim]
     """
-    orig_dtype = q.dtype
-    # Expand for heads dimension
-
-    cos_pos = mx.expand_dims(cos_pos, axis=1)  # [batch, 1, seq_len, head_dim]
-    sin_pos = mx.expand_dims(sin_pos, axis=1)
-
-    # Apply rotation: q_rotated = q * cos + rotate_half(q) * sin
-    q_rotated = rotate_half_interleaved(q)
-    k_rotated = rotate_half_interleaved(k)
-
-    q_embed = (q.astype(mx.float32) * cos_pos) + (
-        q_rotated.astype(mx.float32) * sin_pos
-    )
-    k_embed = (k.astype(mx.float32) * cos_pos) + (
-        k_rotated.astype(mx.float32) * sin_pos
-    )
-
-    return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
+    return apply_rotary_pos_emb_even_odd(q, k, cos_pos, sin_pos, cos_layout="full")
 
 
 class Attention(nn.Module):
@@ -207,6 +138,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -229,14 +161,17 @@ class Attention(nn.Module):
             position_ids = mx.arange(offset, offset + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
 
-        cos, sin = self.rotary_emb(values, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(values, position_ids)
+        else:
+            cos, sin = position_embeddings
         queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
+            mask = mask[..., : kv_sequence_length(keys)]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -410,9 +345,16 @@ class Ernie4_5VLDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         token_type_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
         h = x + r
         if isinstance(self.mlp, Ernie4_5_MoeMLP):
             r = self.mlp(
@@ -455,10 +397,22 @@ class Ernie4_5Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
+        position_embeddings = None
+        if position_ids is not None and self.layers:
+            position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c, position_ids, token_type_ids=token_type_ids)
+            h = layer(
+                h,
+                mask=mask,
+                cache=c,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                token_type_ids=token_type_ids,
+            )
 
         return self.norm(h)
 
@@ -586,6 +540,13 @@ class LanguageModel(nn.Module):
                     text_pos_3d = mx.stack([text_pos, text_pos, text_pos], axis=0)
                     llm_pos_ids_list.append(text_pos_3d)
 
+                if not llm_pos_ids_list:
+                    batch_position_ids.append(
+                        mx.zeros((seq_length, 3), dtype=input_ids.dtype)
+                    )
+                    mrope_position_deltas.append(0)
+                    continue
+
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1)  # [3, seq_len]
                 batch_position_ids.append(llm_positions.T)  # [seq_len, 3]
                 mrope_position_deltas.append(llm_positions.max() + 1 - seq_length)
@@ -613,30 +574,66 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
 
         if pixel_values is not None:
             self._rope_deltas = None
 
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
+        cache_offsets = None
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            cache_offset = offset.item() if isinstance(offset, mx.array) else offset
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                # Per-sequence offsets from BatchKVCache: keep the array
+                # for per-row position_ids + delta arithmetic.
+                cache_offsets = c0.offset
 
         if position_ids is None and (mask is None or mask.ndim == 2):
-            if (
-                cache is None or cache[0] is None or cache_offset == 0
-            ) or self._rope_deltas is None:
+            is_prefill = (
+                cache is None
+                or cache[0] is None
+                or (cache_offsets is None and cache_offset == 0)
+            )
+            if is_prefill or self._rope_deltas is None:
                 position_ids, rope_deltas = self.get_rope_index(
                     inputs, image_grid_thw, video_grid_thw, mask
                 )
                 self._rope_deltas = rope_deltas
             else:
                 batch_size, seq_length = inputs.shape
-                delta = cache_offset + self._rope_deltas if cache is not None else 0
-                position_ids = mx.arange(seq_length) + delta
-                position_ids = mx.broadcast_to(
-                    position_ids[None, :], (batch_size, seq_length)
+                rope_deltas_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
                 )
+                # Per-sequence rope_deltas (shape (B,) or (B, 1)) need per-row
+                # broadcast; a scalar delta stays 0-D.
+                if isinstance(rope_deltas_src, mx.array) and rope_deltas_src.ndim >= 1:
+                    delta = rope_deltas_src
+                    if delta.ndim == 1:
+                        delta = delta[:, None]
+                    if delta.shape[0] > batch_size:
+                        delta = delta[:batch_size]
+                    if cache_offsets is not None:
+                        offsets = cache_offsets[:batch_size].reshape(-1, 1)
+                        delta = offsets + delta
+                    else:
+                        delta = cache_offset + delta
+                    arange = mx.arange(seq_length).reshape(1, -1)
+                    position_ids = (
+                        mx.broadcast_to(arange, (batch_size, seq_length)) + delta
+                    )
+                else:
+                    delta = cache_offset + rope_deltas_src if cache is not None else 0
+                    position_ids = mx.arange(seq_length) + delta
+                    position_ids = mx.broadcast_to(
+                        position_ids[None, :], (batch_size, seq_length)
+                    )
                 position_ids = mx.stack(
                     [position_ids, position_ids, position_ids], axis=-1
                 )

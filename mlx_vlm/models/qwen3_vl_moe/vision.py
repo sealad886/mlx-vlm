@@ -3,6 +3,7 @@ from itertools import accumulate
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import ensure_fused_sdpa
 from .config import VisionConfig
 
 
@@ -153,10 +154,7 @@ class Attention(nn.Module):
 
         attn_outputs = []
         for q, k, v in zip(*splits):
-            output = mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=self.scale, mask=None
-            )
-            attn_outputs.append(output)
+            attn_outputs.append(ensure_fused_sdpa(q, k, v, self.scale))
 
         output = mx.concat(attn_outputs, axis=2)
         output = output.transpose(0, 2, 1, 3)
@@ -396,7 +394,7 @@ class VisionModel(nn.Module):
         cu_seqlens = []
         for i in range(batch_size):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+            cu_seqlens.append(mx.repeat(seq_len, int(grid_thw[i, 0])))
 
         # Concatenate the cu_seqlens for all items in the batch
         cu_seqlens = mx.concatenate(cu_seqlens)

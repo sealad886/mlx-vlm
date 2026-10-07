@@ -3,33 +3,41 @@ import json
 import logging
 
 import mlx.optimizers as optim
-from datasets import load_dataset
 
-from .trainer import (
-    Colors,
-    TrainingArgs,
-    VisionDataset,
-    print_trainable_parameters,
-    train,
-)
+try:
+    from datasets import load_dataset
+except ModuleNotFoundError as e:  # optional 'train' extra
+    raise ImportError(
+        "Fine-tuning requires the 'train' extra: pip install 'mlx-vlm[train]'"
+    ) from e
+
+from .trainer.datasets import PreferenceVisionDataset, VisionDataset
+from .trainer.orpo_trainer import ORPOTrainingArgs, train_orpo
+from .trainer.sft_trainer import TrainingArgs, train
 from .trainer.utils import (
+    Colors,
     apply_lora_layers,
     find_all_linear_names,
     get_peft_model,
     not_supported_for_training,
+    print_trainable_parameters,
     unfreeze_modules,
 )
-from .utils import load, load_image_processor
+from .utils import load
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
 def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None):
     """
     Only transform dataset to messages format for VLMs with single-turn QA and image columns.
     If the dataset already has a 'messages' column, return as is.
-    Otherwise, require 'question', 'answer', and 'image' or 'images' columns.
+    Otherwise, require 'question' and 'answer' columns.
+    If present, 'image' or 'images' columns are included in the user content.
     No multi-turn or template logic. No audio support.
     """
     has_messages = (
@@ -41,17 +49,21 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
     if has_messages:
         return dataset
 
-    if not (has_qa and has_images):
+    if not has_qa:
         raise ValueError(
-            "Dataset must have 'messages' column or both 'question' and 'answer' columns and an 'image' or 'images' column."
+            "Dataset must have a 'messages' column or both 'question' and 'answer' columns. Optional image columns: 'image' or 'images'."
         )
 
-    image_col = "images" if "images" in dataset.column_names else "image"
+    image_col = (
+        "images"
+        if "images" in dataset.column_names
+        else "image" if has_images else None
+    )
 
     def to_message(example):
         q = example["question"]
         a = example["answer"]
-        img = example[image_col] if has_images else None
+        img = example[image_col] if image_col else None
         if custom_prompt_format:
             try:
                 template = json.loads(custom_prompt_format)
@@ -73,45 +85,12 @@ def transform_dataset_to_messages(dataset, model_type, custom_prompt_format=None
             except Exception as e:
                 raise ValueError(f"Failed to parse or fill custom prompt format: {e}")
 
-        # VLM-specific message formats (fallback)
-        if (
-            model_type == model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
-        ):
-            return {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": q},
-                        ],
-                    },
-                    {"role": "assistant", "content": [{"type": "text", "text": a}]},
-                ]
-            }
-        elif model_type == "deepseek_vl_v2":
-            return {
-                "messages": [
-                    {
-                        "role": "<|User|>",
-                        "content": f"<image>\n<|ref|>{q}<|/ref|>.",
-                        "images": [img],
-                    },
-                    {"role": "<|Assistant|>", "content": a},
-                ]
-            }
-        else:
-            return {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"<image>{q}" if "<image>" not in str(q) else q,
-                    },
-                    {"role": "assistant", "content": a},
-                ]
-            }
+        return {
+            "messages": [
+                {"role": "user", "content": q},
+                {"role": "assistant", "content": a},
+            ]
+        }
 
     return dataset.map(
         to_message,
@@ -162,6 +141,11 @@ def setup_model_for_training(model, args, adapter_path=None):
 
 
 def main(args):
+    args.output_path = (
+        args.output_path
+        if args.output_path.endswith(".safetensors")
+        else args.output_path + "/adapters.safetensors"
+    )
     # Load model and processor
     logger.info(f"{Colors.HEADER}Loading model from {args.model_path}{Colors.ENDC}")
     model, processor = load(
@@ -174,7 +158,6 @@ def main(args):
         raise ValueError(f"Model type {model_type} not supported for training")
 
     config = model.config.__dict__
-    image_processor = load_image_processor(args.model_path)
 
     # Load and prepare dataset
     logger.info(f"{Colors.HEADER}Loading dataset from {args.dataset}{Colors.ENDC}")
@@ -190,21 +173,28 @@ def main(args):
     else:
         iters = args.iters
 
-    dataset = dataset.select(range(iters))
-
-    # Transform dataset to messages format (support custom prompt template)
-    dataset = transform_dataset_to_messages(
-        dataset, model_type, args.custom_prompt_format
-    )
+    # Transform dataset to messages format (SFT only; ORPO uses chosen/rejected directly)
+    if args.train_mode != "orpo":
+        dataset = transform_dataset_to_messages(
+            dataset, model_type, args.custom_prompt_format
+        )
 
     # Create training dataset
-    train_dataset = VisionDataset(
-        dataset,
-        config,
-        processor,
-        image_processor=image_processor,
-        image_resize_shape=args.image_resize_shape,
-    )
+    if args.train_mode == "orpo":
+        train_dataset = PreferenceVisionDataset(
+            dataset,
+            config,
+            processor,
+            image_resize_shape=args.image_resize_shape,
+        )
+    else:
+        train_dataset = VisionDataset(
+            dataset,
+            config,
+            processor,
+            image_resize_shape=args.image_resize_shape,
+            train_on_completions=args.train_on_completions,
+        )
 
     # Setup model for training
     model = setup_model_for_training(model, args, args.adapter_path)
@@ -214,34 +204,60 @@ def main(args):
     logger.info(f"{Colors.HEADER}Setting up optimizer{Colors.ENDC}")
     optimizer = optim.Adam(learning_rate=args.learning_rate)
 
-    # Create training arguments
-    training_args = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=iters,
-        steps_per_report=args.steps_per_report,
-        steps_per_eval=args.steps_per_eval,
-        steps_per_save=args.steps_per_save,
-        val_batches=args.val_batches,
-        max_seq_length=args.max_seq_length,
-        adapter_file=args.output_path,
-        grad_checkpoint=args.grad_checkpoint,
-        learning_rate=args.learning_rate,
-        grad_clip=args.grad_clip,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        full_finetune=args.full_finetune,
-    )
-
     # Train model
-    logger.info(f"{Colors.HEADER}Training model{Colors.ENDC}")
-    train(
-        model=model,
-        optimizer=optimizer,
-        train_dataset=train_dataset,
-        val_dataset=None,
-        args=training_args,
-        train_on_completions=args.train_on_completions,
-        assistant_id=args.assistant_id,
-    )
+    logger.info(f"{Colors.HEADER}Training model ({args.train_mode}){Colors.ENDC}")
+    if args.train_mode == "orpo":
+        training_args = ORPOTrainingArgs(
+            batch_size=args.batch_size,
+            iters=iters,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.steps_per_save,
+            val_batches=args.val_batches,
+            max_seq_length=args.max_seq_length,
+            adapter_file=args.output_path,
+            grad_checkpoint=args.grad_checkpoint,
+            learning_rate=args.learning_rate,
+            grad_clip=args.grad_clip,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            full_finetune=args.full_finetune,
+            beta=args.beta,
+            eps=args.eps,
+        )
+        train_orpo(
+            model=model,
+            optimizer=optimizer,
+            train_dataset=train_dataset,
+            val_dataset=None,
+            args=training_args,
+            train_on_completions=args.train_on_completions,
+            assistant_id=args.assistant_id,
+        )
+    else:
+        training_args = TrainingArgs(
+            batch_size=args.batch_size,
+            iters=iters,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.steps_per_save,
+            val_batches=args.val_batches,
+            max_seq_length=args.max_seq_length,
+            adapter_file=args.output_path,
+            grad_checkpoint=args.grad_checkpoint,
+            learning_rate=args.learning_rate,
+            grad_clip=args.grad_clip,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            full_finetune=args.full_finetune,
+        )
+        train(
+            model=model,
+            optimizer=optimizer,
+            train_dataset=train_dataset,
+            val_dataset=None,
+            args=training_args,
+            train_on_completions=args.train_on_completions,
+            assistant_id=args.assistant_id,
+        )
 
     logger.info(
         f"{Colors.HEADER}Training completed! Model saved to {args.output_path}{Colors.ENDC}"
@@ -278,7 +294,7 @@ if __name__ == "__main__":
     parser.add_argument("--steps-per-report", type=int, default=10)
     parser.add_argument("--steps-per-eval", type=int, default=200)
     parser.add_argument("--steps-per-save", type=int, default=100)
-    parser.add_argument("--val-batches", type=int, default=25)
+    parser.add_argument("--val-batches", type=int, default=4)
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--grad-checkpoint", action="store_true")
     parser.add_argument("--grad-clip", type=float, default=None)
@@ -290,6 +306,23 @@ if __name__ == "__main__":
     parser.add_argument("--lora-alpha", type=float, default=16)
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
+
+    # Training mode
+    parser.add_argument(
+        "--train-mode",
+        type=str,
+        default="sft",
+        choices=["sft", "orpo"],
+        help="Training mode: 'sft' (default) or 'orpo'",
+    )
+
+    # ORPO-specific arguments
+    parser.add_argument(
+        "--beta", type=float, default=0.1, help="ORPO beta (odds-ratio weight)"
+    )
+    parser.add_argument(
+        "--eps", type=float, default=1e-8, help="ORPO numerical stability epsilon"
+    )
 
     # Output arguments
     parser.add_argument("--output-path", type=str, default="adapters.safetensors")

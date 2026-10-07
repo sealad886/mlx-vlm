@@ -303,7 +303,6 @@ class VisionModel(nn.Module):
                 vit_merger_window_size,
             )
 
-            # Replace torch operations with numpy
             seqlens = mx.sum(index_padded != -100, axis=(2, 3)).reshape(-1)
             index_padded = index_padded.reshape(-1)
             index = np.where(index_padded != -100)[
@@ -319,7 +318,6 @@ class VisionModel(nn.Module):
             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
             window_index_id += int(grid_t * llm_grid_h * llm_grid_w)
 
-        # Replace torch.cat with np.concatenate
         window_index = mx.concatenate(window_index, axis=0)
         cu_window_seqlens = mx.array(cu_window_seqlens)
 
@@ -366,7 +364,7 @@ class VisionModel(nn.Module):
         cu_seqlens = []
         for i in range(batch_size):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+            cu_seqlens.append(mx.repeat(seq_len, int(grid_thw[i, 0])))
 
         # Concatenate the cu_seqlens for all items in the batch
         cu_seqlens = mx.concatenate(cu_seqlens)

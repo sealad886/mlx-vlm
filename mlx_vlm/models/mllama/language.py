@@ -9,6 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -67,7 +68,10 @@ class MllamaTextCrossAttention(nn.Module):
                 .transpose(0, 2, 1, 3)
             )
             key_states = self.k_norm(key_states)
-        elif cache is not None and cache.offset > 0:
+        elif cache is not None and (
+            (isinstance(cache.offset, mx.array) and cache.offset.max().item() > 0)
+            or (not isinstance(cache.offset, mx.array) and cache.offset > 0)
+        ):
             key_states, value_states = cache.fetch()
         else:
             key_states, value_states = mx.split(query, 2, axis=1)
@@ -112,11 +116,12 @@ class MllamaTextSelfAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.rope = nn.RoPE(
-            self.head_dim,
-            traditional=config.rope_traditional,
+        self.rope = initialize_rope(
+            dims=self.head_dim,
             base=config.rope_theta,
-            scale=1,
+            traditional=config.rope_traditional,
+            scaling_config=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(
@@ -141,8 +146,19 @@ class MllamaTextSelfAttention(nn.Module):
         )
 
         if cache is not None:
-            query_states = self.rope(query_states, offset=cache.offset)
-            key_states = self.rope(key_states, offset=cache.offset)
+            # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
+            if hasattr(cache, "_idx"):
+                offset = int(cache._idx)
+            else:
+                offset = cache.offset
+                if isinstance(offset, mx.array):
+                    offset = (
+                        int(offset.max().item())
+                        if offset.size > 1
+                        else int(offset.item())
+                    )
+            query_states = self.rope(query_states, offset=offset)
+            key_states = self.rope(key_states, offset=offset)
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
         else:
             query_states = self.rope(query_states)

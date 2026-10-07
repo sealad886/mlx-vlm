@@ -1,15 +1,36 @@
-from typing import Any, Optional
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
+from ..qwen3_5.language import MTPDecoderLayer, MTPModule
 from ..qwen3_5.language import Qwen3_5Attention as Qwen3_5MoeAttention
 from ..qwen3_5.language import Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet
 from ..qwen3_5.language import Qwen3_5MLP as Qwen3_5MoeMLP
-from ..qwen3_5.language import Qwen3_5Model
+from ..qwen3_5.language import Qwen3_5Model, _target_verify_linear
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
+
+
+def _target_verify_switch_glu(switch_mlp: SwitchGLU, x, indices, target_verify: bool):
+    if not (target_verify and x.ndim == 3 and x.shape[1] > 1):
+        return switch_mlp(x, indices)
+
+    B, T, D = x.shape
+    k = indices.shape[-1]
+    flat_x = x.reshape(B * T, D)
+    flat_indices = indices.reshape(B * T, k)
+    flat_x = mx.expand_dims(flat_x, (-2, -3))
+
+    up = switch_mlp.up_proj(flat_x, flat_indices, sorted_indices=False)
+    gate = switch_mlp.gate_proj(flat_x, flat_indices, sorted_indices=False)
+    out = switch_mlp.down_proj(
+        switch_mlp.activation(up, gate),
+        flat_indices,
+        sorted_indices=False,
+    )
+    return out.squeeze(-2).reshape(B, T, k, -1)
 
 
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
@@ -31,8 +52,9 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
     def __call__(
         self,
         x: mx.array,
+        target_verify: bool = False,
     ) -> mx.array:
-        gates = self.gate(x)
+        gates = _target_verify_linear(self.gate, x, target_verify)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
@@ -40,11 +62,14 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         scores = mx.take_along_axis(gates, inds, axis=-1)
         scores = scores / scores.sum(axis=-1, keepdims=True)
 
-        y = self.switch_mlp(x, inds)
+        y = _target_verify_switch_glu(self.switch_mlp, x, inds, target_verify)
         y = (y * scores[..., None]).sum(axis=-2)
 
-        shared_y = self.shared_expert(x)
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        shared_y = self.shared_expert(x, target_verify)
+        shared_y = (
+            mx.sigmoid(_target_verify_linear(self.shared_expert_gate, x, target_verify))
+            * shared_y
+        )
 
         return y + shared_y
 
@@ -67,21 +92,50 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        position_ids: Optional[mx.array] = None,
+        mask: mx.array | None = None,
+        cache: Any | None = None,
+        position_ids: mx.array | None = None,
+        position_embeddings: tuple[mx.array, mx.array] | None = None,
+        gdn_sink: list | None = None,
+        target_verify: bool = False,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x),
+                mask,
+                cache,
+                gdn_sink=gdn_sink,
+                target_verify=target_verify,
+            )
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+            r = self.self_attn(
+                self.input_layernorm(x),
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                target_verify=target_verify,
+            )
         h = x + r
-        out = h + self.mlp(self.post_attention_layernorm(h))
+        out = h + self.mlp(self.post_attention_layernorm(h), target_verify)
         return out
 
 
-class Qwen3_5MoeModel(Qwen3_5Model):
+class MTPMoeDecoderLayer(MTPDecoderLayer):
+    """Full-attention MTP layer with the Qwen3.5 MoE feed-forward block."""
 
+    def __init__(self, args: TextConfig):
+        nn.Module.__init__(self)
+        self.is_linear = False
+        self.self_attn = Qwen3_5MoeAttention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.mlp = Qwen3_5MoeSparseMoeBlock(args)
+
+
+class Qwen3_5MoeModel(Qwen3_5Model):
     def __init__(self, args: TextConfig):
         nn.Module.__init__(self)
         self.args = args
@@ -96,7 +150,6 @@ class Qwen3_5MoeModel(Qwen3_5Model):
 
 
 class LanguageModel(Qwen3_5LanguageModel):
-
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
         self.args = args
@@ -108,3 +161,5 @@ class LanguageModel(Qwen3_5LanguageModel):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if getattr(args, "mtp_num_hidden_layers", 0) > 0:
+            self.mtp = MTPModule(args, MTPMoeDecoderLayer)
